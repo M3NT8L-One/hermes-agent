@@ -7,6 +7,7 @@ Jaccard similarity reranking and trust-weighted scoring.
 from __future__ import annotations
 
 import math
+import re
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
@@ -84,21 +85,27 @@ class FactRetriever:
             if self.hrr_weight > 0 and fact.get("hrr_vector"):
                 fact_vec = hrr.bytes_to_phases(fact["hrr_vector"])
                 query_vec = hrr.encode_text(query, self.hrr_dim)
-                hrr_sim = (hrr.similarity(query_vec, fact_vec) + 1.0) / 2.0  # shift to [0,1]
+                hrr_sim = (
+                    hrr.similarity(query_vec, fact_vec) + 1.0
+                ) / 2.0  # shift to [0,1]
             else:
                 hrr_sim = 0.5  # neutral
 
             # Combine FTS5 + Jaccard + HRR
-            relevance = (self.fts_weight * fts_score
-                        + self.jaccard_weight * jaccard
-                        + self.hrr_weight * hrr_sim)
+            relevance = (
+                self.fts_weight * fts_score
+                + self.jaccard_weight * jaccard
+                + self.hrr_weight * hrr_sim
+            )
 
             # Trust weighting
             score = relevance * fact["trust_score"]
 
             # Optional temporal decay
             if self.half_life > 0:
-                score *= self._temporal_decay(fact.get("updated_at") or fact.get("created_at"))
+                score *= self._temporal_decay(
+                    fact.get("updated_at") or fact.get("created_at")
+                )
 
             fact["score"] = score
             scored.append(fact)
@@ -181,7 +188,9 @@ class FactRetriever:
             residual = hrr.unbind(fact_vec, probe_key)
             # Compare residual against content signal
             role_content = hrr.encode_atom("__hrr_role_content__", self.hrr_dim)
-            content_vec = hrr.bind(hrr.encode_text(fact["content"], self.hrr_dim), role_content)
+            content_vec = hrr.bind(
+                hrr.encode_text(fact["content"], self.hrr_dim), role_content
+            )
             sim = hrr.similarity(residual, content_vec)
             fact["score"] = (sim + 1.0) / 2.0 * fact["trust_score"]
             scored.append(fact)
@@ -380,7 +389,9 @@ class FactRetriever:
         # Above that, only check the most recently updated facts.
         _MAX_CONTRADICT_FACTS = 500
         if len(rows) > _MAX_CONTRADICT_FACTS:
-            rows = sorted(rows, key=lambda r: r["updated_at"] or r["created_at"], reverse=True)
+            rows = sorted(
+                rows, key=lambda r: r["updated_at"] or r["created_at"], reverse=True
+            )
             rows = rows[:_MAX_CONTRADICT_FACTS]
 
         # Build entity sets per fact
@@ -411,7 +422,9 @@ class FactRetriever:
                     continue
 
                 # Entity overlap (Jaccard)
-                entity_overlap = len(ents1 & ents2) / len(ents1 | ents2) if (ents1 | ents2) else 0.0
+                entity_overlap = (
+                    len(ents1 & ents2) / len(ents1 | ents2) if (ents1 | ents2) else 0.0
+                )
 
                 if entity_overlap < 0.3:
                     continue  # Not enough entity overlap to be contradictory
@@ -492,37 +505,42 @@ class FactRetriever:
         """
         conn = self.store._conn
 
-        # Build query - FTS5 rank is negative (lower = better match)
-        # We need to join facts_fts with facts to get all columns
-        params: list = []
-        where_clauses = ["facts_fts MATCH ?"]
-        params.append(query)
+        def execute_match(match_query: str) -> list:
+            # Build query - FTS5 rank is negative (lower = better match)
+            # We need to join facts_fts with facts to get all columns.
+            params: list = []
+            where_clauses = ["facts_fts MATCH ?"]
+            params.append(match_query)
 
-        if category:
-            where_clauses.append("f.category = ?")
-            params.append(category)
+            if category:
+                where_clauses.append("f.category = ?")
+                params.append(category)
 
-        where_clauses.append("f.trust_score >= ?")
-        params.append(min_trust)
+            where_clauses.append("f.trust_score >= ?")
+            params.append(min_trust)
 
-        where_sql = " AND ".join(where_clauses)
+            where_sql = " AND ".join(where_clauses)
 
-        sql = f"""
-            SELECT f.*, facts_fts.rank as fts_rank_raw
-            FROM facts_fts
-            JOIN facts f ON f.fact_id = facts_fts.rowid
-            WHERE {where_sql}
-            ORDER BY facts_fts.rank
-            LIMIT ?
-        """
-        params.append(limit)
+            sql = f"""
+                SELECT f.*, facts_fts.rank as fts_rank_raw
+                FROM facts_fts
+                JOIN facts f ON f.fact_id = facts_fts.rowid
+                WHERE {where_sql}
+                ORDER BY facts_fts.rank
+                LIMIT ?
+            """
+            params.append(limit)
+            try:
+                return conn.execute(sql, params).fetchall()
+            except Exception:
+                # FTS5 MATCH can fail on malformed natural-language queries.
+                return []
 
-        try:
-            rows = conn.execute(sql, params).fetchall()
-        except Exception:
-            # FTS5 MATCH can fail on malformed queries — fall back to empty
-            return []
-
+        rows = execute_match(query)
+        if not rows:
+            relaxed_query = self._relaxed_fts_query(query)
+            if relaxed_query and relaxed_query != query:
+                rows = execute_match(relaxed_query)
         if not rows:
             return []
 
@@ -540,6 +558,61 @@ class FactRetriever:
             results.append(fact)
 
         return results
+
+    @staticmethod
+    def _relaxed_fts_query(text: str) -> str:
+        """Build a forgiving OR query for natural-language prompts.
+
+        FTS5's raw MATCH syntax has strict AND/phrase semantics and can reject
+        hyphens, slashes, URLs, or long prompt text. Holographic prefetch passes
+        whole user messages, so a fallback OR query keeps local memory useful
+        without requiring the model to know exact fact-store keywords.
+        """
+        if not text:
+            return ""
+        stopwords = {
+            "a",
+            "an",
+            "and",
+            "are",
+            "as",
+            "at",
+            "be",
+            "by",
+            "for",
+            "from",
+            "how",
+            "i",
+            "if",
+            "in",
+            "is",
+            "it",
+            "me",
+            "my",
+            "of",
+            "on",
+            "or",
+            "our",
+            "the",
+            "this",
+            "to",
+            "using",
+            "what",
+            "when",
+            "where",
+            "with",
+            "you",
+            "your",
+        }
+        terms: list[str] = []
+        for term in re.findall(r"[A-Za-z0-9_]+", text.lower()):
+            if len(term) < 3 or term in stopwords:
+                continue
+            if term not in terms:
+                terms.append(term)
+            if len(terms) >= 16:
+                break
+        return " OR ".join(f'"{term}"' for term in terms)
 
     @staticmethod
     def _tokenize(text: str) -> set[str]:
