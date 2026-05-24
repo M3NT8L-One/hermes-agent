@@ -10,6 +10,7 @@ from gateway.session_context import (
     get_session_env,
     set_session_vars,
     clear_session_vars,
+    set_current_session_id,
     _VAR_MAP,
     _UNSET,
 )
@@ -312,13 +313,53 @@ async def test_run_in_executor_with_context_forwards_args():
     assert result == 10
 
 
+def test_gateway_session_id_contextvar_does_not_clobber_process_env(monkeypatch):
+    """Gateway-mode session ID rotation is ContextVar-only, never global env."""
+    monkeypatch.setenv("HERMES_SESSION_ID", "stale-global")
+    set_session_vars(platform="telegram", chat_id="chat-1", session_key="telegram:chat-1")
+
+    set_current_session_id("gateway-session-1")
+
+    assert get_session_env("HERMES_SESSION_ID") == "gateway-session-1"
+    assert os.environ["HERMES_SESSION_ID"] == "stale-global"
+
+
+def test_cli_session_id_sync_can_explicitly_update_process_env(monkeypatch):
+    """Single-session CLI paths still have an explicit env-sync escape hatch."""
+    monkeypatch.delenv("_HERMES_GATEWAY", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+
+    set_current_session_id("cli-session-1", sync_process_env=True)
+
+    assert get_session_env("HERMES_SESSION_ID") == "cli-session-1"
+    assert os.environ["HERMES_SESSION_ID"] == "cli-session-1"
+
+
 @pytest.mark.asyncio
 async def test_run_in_executor_with_context_propagates_exceptions():
     """Exceptions inside the executor should propagate to the caller."""
     runner = object.__new__(GatewayRunner)
 
-    def blow_up():
-        raise ValueError("boom")
+    def boom():
+        raise RuntimeError("boom")
 
-    with pytest.raises(ValueError, match="boom"):
-        await runner._run_in_executor_with_context(blow_up)
+    with pytest.raises(RuntimeError, match="boom"):
+        await runner._run_in_executor_with_context(boom)
+
+
+def test_gateway_run_does_not_write_session_key_to_global_env():
+    """Gateway workers must not mirror per-message session keys into os.environ.
+
+    The gateway handles concurrent sessions in one process, so per-message
+    HERMES_SESSION_KEY belongs in gateway.session_context ContextVars only.
+    CLI/cron/ACP compatibility may still use env fallback outside gateway/run.py.
+    """
+    from pathlib import Path
+
+    gateway_run = (Path(__file__).parent.parent.parent / "gateway" / "run.py").read_text(
+        encoding="utf-8"
+    )
+    assert 'os.environ["HERMES_SESSION_KEY"]' not in gateway_run
+    assert "os.environ['HERMES_SESSION_KEY']" not in gateway_run
+    assert 'os.environ["HERMES_SESSION_ID"]' not in gateway_run
+    assert "os.environ['HERMES_SESSION_ID']" not in gateway_run
