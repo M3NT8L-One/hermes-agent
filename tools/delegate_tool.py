@@ -511,6 +511,7 @@ def _preserve_parent_mcp_toolsets(
 
 DEFAULT_MAX_ITERATIONS = 50
 DEFAULT_CHILD_TIMEOUT = 600  # seconds before a child agent is considered stuck
+SUBAGENT_TIMEOUT_CLEANUP_GRACE_SECONDS = 2.0  # bounded wait after interrupt on timeout
 _HEARTBEAT_INTERVAL = 30  # seconds between parent activity heartbeats during delegation
 # Stale-heartbeat thresholds. A child with no API-call progress is either:
 #   - idle between turns (no current_tool) — probably stuck on a slow API call
@@ -1182,15 +1183,17 @@ def _dump_subagent_timeout_diagnostic(
     duration_seconds: float,
     worker_thread: Optional[threading.Thread],
     goal: str,
+    cleanup_status: str = "unknown",
+    cleanup_error: Optional[str] = None,
 ) -> Optional[str]:
-    """Write a structured diagnostic dump for a subagent that timed out
-    before making any API call.
+    """Write a structured diagnostic dump for a timed-out subagent.
 
     See issue #14726: users hit "subagent timed out after 300s with no response"
-    with zero API calls and no way to inspect what happened. This helper
-    writes a dedicated log under ``~/.hermes/logs/subagent-<sid>-<ts>.log``
-    capturing the child's config, system-prompt / tool-schema sizes, activity
-    tracker snapshot, and the worker thread's Python stack at timeout.
+    with too little information to inspect what happened. This helper writes
+    a dedicated log under ``~/.hermes/logs/subagent-<sid>-<ts>.log`` capturing
+    the child's config, system-prompt / tool-schema sizes, activity tracker
+    snapshot, bounded cleanup result, and the worker thread's Python stack at
+    timeout.
 
     Returns the absolute path to the diagnostic file, or None on failure.
     """
@@ -1288,6 +1291,14 @@ def _dump_subagent_timeout_diagnostic(
             _w(f"  <get_activity_summary failed: {exc}>")
         _w("")
 
+        _w("## Cleanup after timeout")
+        _w(f"  interrupt_status: {cleanup_status}")
+        if cleanup_error:
+            _w(f"  cleanup_error: {cleanup_error}")
+        if worker_thread is not None:
+            _w(f"  worker_alive_after_interrupt: {worker_thread.is_alive()}")
+        _w("")
+
         _w("## Worker thread stack at timeout")
         if worker_thread is not None and worker_thread.is_alive():
             frames = _sys._current_frames()
@@ -1306,10 +1317,12 @@ def _dump_subagent_timeout_diagnostic(
         _w("")
 
         _w("## Notes")
-        _w("  This file is written ONLY when a subagent times out with 0 API calls.")
+        _w("  This file is written when a subagent times out.")
         _w("  0-API-call timeouts mean the child never reached its first LLM request.")
-        _w("  Common causes: oversized prompt rejected by provider, transport hang,")
-        _w("  credential resolution stuck. See issue #14726 for context.")
+        _w("  Nonzero-API-call timeouts usually mean a slow provider response,")
+        _w("  unresponsive network request, or a tool that did not observe interrupt.")
+        _w("  Common 0-call causes: oversized prompt rejected by provider,")
+        _w("  transport hang, credential resolution stuck. See issue #14726 for context.")
 
         dump_path.write_text("\n".join(lines), encoding="utf-8")
         return str(dump_path)
@@ -1512,28 +1525,45 @@ def _run_single_child(
         _child_future = _timeout_executor.submit(_run_with_thread_capture)
         try:
             result = _child_future.result(timeout=child_timeout)
-        except Exception as _timeout_exc:
-            # Signal the child to stop so its thread can exit cleanly.
+        except FuturesTimeoutError as _timeout_exc:
+            # Signal the child to stop so its thread can exit cleanly, then
+            # wait a small bounded grace period to observe whether cleanup
+            # actually completed.  Do not block indefinitely: a child can be
+            # wedged in blocking I/O that never observes the interrupt flag.
+            cleanup_status = "interrupt_unavailable"
+            cleanup_error: Optional[str] = None
             try:
                 if hasattr(child, "interrupt"):
                     child.interrupt()
+                    cleanup_status = "interrupt_requested"
                 elif hasattr(child, "_interrupt_requested"):
                     child._interrupt_requested = True
-            except Exception:
-                pass
+                    cleanup_status = "interrupt_flag_set"
+            except Exception as exc:
+                cleanup_status = "interrupt_failed"
+                cleanup_error = f"{type(exc).__name__}: {exc}"
 
-            is_timeout = isinstance(_timeout_exc, (FuturesTimeoutError, TimeoutError))
+            if cleanup_status in {"interrupt_requested", "interrupt_flag_set"}:
+                try:
+                    _child_future.result(timeout=SUBAGENT_TIMEOUT_CLEANUP_GRACE_SECONDS)
+                    cleanup_status = "worker_exited_after_interrupt"
+                except FuturesTimeoutError:
+                    cleanup_status = "worker_still_running_after_interrupt"
+                except Exception as exc:
+                    cleanup_status = "worker_exited_with_error_after_interrupt"
+                    cleanup_error = f"{type(exc).__name__}: {exc}"
+
             duration = round(time.monotonic() - child_start, 2)
             logger.warning(
-                "Subagent %d %s after %.1fs",
+                "Subagent %d timed out after %.1fs (cleanup=%s)",
                 task_index,
-                "timed out" if is_timeout else f"raised {type(_timeout_exc).__name__}",
                 duration,
+                cleanup_status,
             )
 
-            # When a subagent times out BEFORE making any API call, dump a
-            # diagnostic to help users (and us) see what the child was doing.
-            # See #14726 — without this, 0-API-call hangs are black boxes.
+            # Always write a timeout diagnostic now.  0-call hangs are still
+            # called out, but nonzero-call timeouts also need a stack + cleanup
+            # artifact for operators to decide whether a tool/provider hung.
             diagnostic_path: Optional[str] = None
             child_api_calls = 0
             try:
@@ -1541,72 +1571,111 @@ def _run_single_child(
                 child_api_calls = int(_summary.get("api_call_count", 0) or 0)
             except Exception:
                 pass
-            if is_timeout and child_api_calls == 0:
-                diagnostic_path = _dump_subagent_timeout_diagnostic(
-                    child=child,
-                    task_index=task_index,
-                    timeout_seconds=float(child_timeout),
-                    duration_seconds=float(duration),
-                    worker_thread=_worker_thread_holder.get("t"),
-                    goal=goal,
+            diagnostic_path = _dump_subagent_timeout_diagnostic(
+                child=child,
+                task_index=task_index,
+                timeout_seconds=float(child_timeout),
+                duration_seconds=float(duration),
+                worker_thread=_worker_thread_holder.get("t"),
+                goal=goal,
+                cleanup_status=cleanup_status,
+                cleanup_error=cleanup_error,
+            )
+            if diagnostic_path:
+                logger.warning(
+                    "Subagent %d timeout diagnostic written to %s",
+                    task_index,
+                    diagnostic_path,
                 )
-                if diagnostic_path:
-                    logger.warning(
-                        "Subagent %d 0-API-call timeout — diagnostic written to %s",
-                        task_index,
-                        diagnostic_path,
-                    )
 
             if child_progress_cb:
                 try:
                     child_progress_cb(
+                        "subagent.timeout_cleanup",
+                        preview=cleanup_status,
+                        status="timeout",
+                        duration_seconds=duration,
+                        diagnostic_path=diagnostic_path or "",
+                    )
+                    child_progress_cb(
                         "subagent.complete",
-                        preview=(
-                            f"Timed out after {duration}s"
-                            if is_timeout
-                            else str(_timeout_exc)
-                        ),
-                        status="timeout" if is_timeout else "error",
+                        preview=f"Timed out after {duration}s",
+                        status="timeout",
+                        duration_seconds=duration,
+                        summary="",
+                        diagnostic_path=diagnostic_path or "",
+                    )
+                except Exception:
+                    pass
+
+            if child_api_calls == 0:
+                _err = (
+                    f"Subagent timed out after {child_timeout}s without "
+                    f"making any API call — the child never reached its "
+                    f"first LLM request (prompt construction, credential "
+                    f"resolution, or transport may be stuck)."
+                )
+            else:
+                _err = (
+                    f"Subagent timed out after {child_timeout}s with "
+                    f"{child_api_calls} API call(s) completed — likely "
+                    f"stuck on a slow API call, unresponsive network request, "
+                    f"or tool cleanup that did not observe interrupt."
+                )
+            _err += f" Cleanup: {cleanup_status}."
+            if diagnostic_path:
+                _err += f" Diagnostic: {diagnostic_path}"
+
+            return {
+                "task_index": task_index,
+                "status": "timeout",
+                "summary": None,
+                "error": _err,
+                "exit_reason": "timeout",
+                "api_calls": child_api_calls,
+                "duration_seconds": duration,
+                "_child_role": getattr(child, "_delegate_role", None),
+                "diagnostic_path": diagnostic_path,
+                "cleanup_status": cleanup_status,
+            }
+        except Exception as _child_exc:
+            duration = round(time.monotonic() - child_start, 2)
+            logger.warning(
+                "Subagent %d raised %s after %.1fs",
+                task_index,
+                type(_child_exc).__name__,
+                duration,
+            )
+            if child_progress_cb:
+                try:
+                    child_progress_cb(
+                        "subagent.complete",
+                        preview=str(_child_exc),
+                        status="error",
                         duration_seconds=duration,
                         summary="",
                     )
                 except Exception:
                     pass
-
-            if is_timeout:
-                if child_api_calls == 0:
-                    _err = (
-                        f"Subagent timed out after {child_timeout}s without "
-                        f"making any API call — the child never reached its "
-                        f"first LLM request (prompt construction, credential "
-                        f"resolution, or transport may be stuck)."
-                    )
-                    if diagnostic_path:
-                        _err += f" Diagnostic: {diagnostic_path}"
-                else:
-                    _err = (
-                        f"Subagent timed out after {child_timeout}s with "
-                        f"{child_api_calls} API call(s) completed — likely "
-                        f"stuck on a slow API call or unresponsive network request."
-                    )
-            else:
-                _err = str(_timeout_exc)
-
             return {
                 "task_index": task_index,
-                "status": "timeout" if is_timeout else "error",
+                "status": "error",
                 "summary": None,
-                "error": _err,
-                "exit_reason": "timeout" if is_timeout else "error",
-                "api_calls": child_api_calls,
+                "error": str(_child_exc),
+                "exit_reason": "error",
+                "api_calls": 0,
                 "duration_seconds": duration,
                 "_child_role": getattr(child, "_delegate_role", None),
-                "diagnostic_path": diagnostic_path,
+                "diagnostic_path": None,
             }
         finally:
             # Shut down executor without waiting — if the child thread
-            # is stuck on blocking I/O, wait=True would hang forever.
-            _timeout_executor.shutdown(wait=False)
+            # is stuck on blocking I/O, wait=True would hang forever.  Also
+            # cancel any not-yet-started futures defensively.
+            try:
+                _timeout_executor.shutdown(wait=False, cancel_futures=True)
+            except TypeError:
+                _timeout_executor.shutdown(wait=False)
 
         # Flush any remaining batched progress to gateway
         if child_progress_cb and hasattr(child_progress_cb, "_flush"):

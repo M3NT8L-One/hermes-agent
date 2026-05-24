@@ -16408,9 +16408,12 @@ class GatewayRunner:
             # `_resolve_turn_agent_config(message, …)`.
             nonlocal message
 
-            # session_key is now set via contextvars in _set_session_env()
-            # (concurrency-safe). Keep os.environ as fallback for CLI/cron.
-            os.environ["HERMES_SESSION_KEY"] = session_key or ""
+            # session_key is already set via contextvars in _set_session_env()
+            # (concurrency-safe). Do not mirror it into os.environ here: the
+            # gateway worker handles concurrent sessions, and process-global
+            # HERMES_SESSION_KEY writes can route tools/background notices to
+            # the wrong chat. CLI/cron compatibility still falls back to env
+            # when no gateway contextvar is set.
 
             # Read from env var or use default (same as CLI)
             max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
