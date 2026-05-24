@@ -37,7 +37,7 @@ needs to replace the import + call site:
 """
 
 from contextvars import ContextVar
-from typing import Any
+from typing import Any, Optional
 
 # Sentinel to distinguish "never set in this context" from "explicitly set to empty".
 # When a contextvar holds _UNSET, we fall back to os.environ (CLI/cron compat).
@@ -83,19 +83,39 @@ _VAR_MAP = {
 }
 
 
-def set_current_session_id(session_id: str) -> None:
-    """Synchronize ``HERMES_SESSION_ID`` across ContextVar and ``os.environ``.
+def set_current_session_id(
+    session_id: str,
+    *,
+    sync_process_env: Optional[bool] = None,
+) -> None:
+    """Set the current session ID in ContextVar, optionally mirroring to env.
 
-    Long-lived single-process entrypoints like the CLI can rotate sessions via
-    ``/new``, ``/resume``, ``/branch``, or compression splits without
-    reconstructing the entire agent. Tools still consult
-    ``get_session_env("HERMES_SESSION_ID")`` with an ``os.environ`` fallback,
-    so both storage paths must move together when the active session changes.
+    Gateway workers must not write per-message session IDs into ``os.environ``:
+    the gateway processes concurrent sessions in one process, so a global write
+    can leak one chat/session into another worker.  CLI-style single-session
+    entrypoints can still request process-env sync for subprocess compatibility
+    by passing ``sync_process_env=True``.
     """
-    import os
-
-    os.environ["HERMES_SESSION_ID"] = session_id
     _SESSION_ID.set(session_id)
+    if sync_process_env is None:
+        # Default to env sync for CLI-style callers, but suppress it when a
+        # gateway session context is active.  Do not key only off
+        # ``_HERMES_GATEWAY``: importing gateway.run sets it process-wide, and
+        # tests/CLI helpers may import gateway modules without being inside a
+        # concurrent gateway worker.
+        sync_process_env = all(
+            var.get() is _UNSET
+            for var in (
+                _SESSION_PLATFORM,
+                _SESSION_CHAT_ID,
+                _SESSION_KEY,
+                _SESSION_MESSAGE_ID,
+            )
+        )
+    if sync_process_env:
+        import os
+
+        os.environ["HERMES_SESSION_ID"] = session_id
 
 
 def set_session_vars(
