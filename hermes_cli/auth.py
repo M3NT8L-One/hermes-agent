@@ -947,11 +947,28 @@ def _load_global_auth_store() -> Dict[str, Any]:
         return {}
 
 
+def _mark_global_pool_entries(entries: List[Any], origin_auth_path: Path) -> List[Any]:
+    """Return global-fallback pool entries with transient origin metadata."""
+    marked: List[Any] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            marked.append(entry)
+            continue
+        item = dict(entry)
+        item["borrowed_from_global"] = True
+        item["origin_auth_path"] = str(origin_auth_path)
+        item["origin_home"] = str(origin_auth_path.parent)
+        marked.append(item)
+    return marked
+
+
 def _auth_lock_path() -> Path:
     return _auth_file_path().with_suffix(".lock")
 
 
 _auth_lock_holder = threading.local()
+_auth_lock_holders_by_path: Dict[str, threading.local] = {}
+_auth_lock_holders_guard = threading.Lock()
 
 
 @contextmanager
@@ -1045,6 +1062,47 @@ def _auth_store_lock(timeout_seconds: float = AUTH_LOCK_TIMEOUT_SECONDS):
         yield
 
 
+@contextmanager
+def _auth_store_lock_for_path(
+    auth_file: Optional[Path] = None,
+    timeout_seconds: float = AUTH_LOCK_TIMEOUT_SECONDS,
+):
+    """Cross-process advisory lock for an explicit auth.json path.
+
+    Profile fallback normally locks the active profile's auth.json.  Root
+    writeback for inherited/global OAuth credentials must instead lock the
+    root auth.json it is updating, otherwise two profile workers can race while
+    rotating the shared singleton refresh token.
+    """
+    if auth_file is None:
+        with _auth_store_lock(timeout_seconds):
+            yield
+        return
+
+    try:
+        if auth_file.resolve(strict=False) == _auth_file_path().resolve(strict=False):
+            with _auth_store_lock(timeout_seconds):
+                yield
+            return
+    except Exception:
+        pass
+
+    lock_key = str(auth_file.with_suffix(".lock").resolve(strict=False))
+    with _auth_lock_holders_guard:
+        holder = _auth_lock_holders_by_path.get(lock_key)
+        if holder is None:
+            holder = threading.local()
+            _auth_lock_holders_by_path[lock_key] = holder
+
+    with _file_lock(
+        Path(lock_key),
+        holder,
+        timeout_seconds,
+        f"Timed out waiting for auth store lock: {auth_file}",
+    ):
+        yield
+
+
 def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
     auth_file = auth_file or _auth_file_path()
     if not auth_file.exists():
@@ -1092,6 +1150,19 @@ def _save_auth_store(auth_store: Dict[str, Any], target_path: Optional[Path] = N
     # OAuth grants (#43589) — reusing this function's atomic O_EXCL + 0o600
     # write so the root auth.json gets the same TOCTOU-safe treatment.
     auth_file = target_path if target_path is not None else _auth_file_path()
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        real_home_env = os.environ.get("HOME", "")
+        real_home_auth = (Path(real_home_env) / ".hermes" / "auth.json").resolve(strict=False) if real_home_env else None
+        try:
+            resolved = auth_file.resolve(strict=False)
+        except Exception:
+            resolved = auth_file
+        if real_home_auth is not None and resolved == real_home_auth:
+            raise RuntimeError(
+                f"Refusing to touch real user auth store during test run: {auth_file}. "
+                "Set HERMES_HOME to a tmp_path in your test fixture, or run "
+                "via scripts/run_tests.sh for hermetic CI-parity env."
+            )
     auth_file.parent.mkdir(parents=True, exist_ok=True)
     # Tighten parent dir to 0o700 so siblings can't traverse to creds.
     # No-op on Windows (POSIX mode bits not enforced); ignore failures.
@@ -1223,7 +1294,7 @@ def get_auth_provider_display_name(provider_id: str) -> str:
     return SERVICE_PROVIDER_NAMES.get(normalized, provider_id)
 
 
-def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
+def read_credential_pool(provider_id: Optional[str] = None) -> Any:
     """Return the persisted credential pool, or one provider slice.
 
     In profile mode, the profile's credential pool is authoritative. If a
@@ -1246,6 +1317,7 @@ def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
 
     global_pool: Dict[str, Any] = {}
     global_store = _load_global_auth_store()
+    global_auth_path = _global_auth_file_path() if global_store else None
     maybe_global_pool = global_store.get("credential_pool") if global_store else None
     if isinstance(maybe_global_pool, dict):
         global_pool = maybe_global_pool
@@ -1259,7 +1331,7 @@ def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
             existing = merged.get(gp_key)
             if isinstance(existing, list) and existing:
                 continue
-            merged[gp_key] = list(gp_entries)
+            merged[gp_key] = _mark_global_pool_entries(gp_entries, global_auth_path) if global_auth_path else list(gp_entries)
         return merged
 
     provider_entries = pool.get(provider_id)
@@ -1267,7 +1339,9 @@ def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
         return list(provider_entries)
     # Profile has no entries for this provider — fall back to global.
     global_entries = global_pool.get(provider_id)
-    return list(global_entries) if isinstance(global_entries, list) else []
+    if not isinstance(global_entries, list):
+        return []
+    return _mark_global_pool_entries(global_entries, global_auth_path) if global_auth_path else list(global_entries)
 
 
 def write_credential_pool(provider_id: str, entries: List[Dict[str, Any]]) -> Path:
