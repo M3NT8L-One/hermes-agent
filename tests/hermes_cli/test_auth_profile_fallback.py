@@ -450,3 +450,78 @@ def test_write_credential_pool_targets_profile_not_global(profile_env):
 
     # Subsequent read returns profile (shadows global).
     assert [e["id"] for e in read_credential_pool("openrouter")] == ["prof-new"]
+
+
+def test_xai_oauth_inherited_profile_refresh_writes_back_to_global_not_profile(profile_env, monkeypatch):
+    """A profile using global xAI OAuth must not strand refreshed tokens locally.
+
+    xAI refresh tokens are single-use. If a profile inherits the root
+    ``credential_pool.xai-oauth`` entry and refreshes it, both the provider
+    singleton and the pool entry must rotate in the global root auth.json.
+    The active profile must stay shadow-free so the default/Telegram session
+    continues to see the fresh pair.
+    """
+    import hermes_cli.auth as auth_mod
+    from agent.credential_pool import load_pool
+
+    _write(profile_env["global"] / "auth.json", _make_auth_store(
+        pool={
+            "xai-oauth": [{
+                "id": "global-xai",
+                "label": "global xAI",
+                "auth_type": "oauth",
+                "priority": 0,
+                "source": "loopback_pkce",
+                "access_token": "access-old",
+                "refresh_token": "refresh-old",
+                "base_url": "https://api.x.ai/v1",
+            }],
+        },
+        providers={
+            "xai-oauth": {
+                "tokens": {
+                    "access_token": "access-old",
+                    "refresh_token": "refresh-old",
+                },
+                "discovery": {"token_endpoint": "https://accounts.x.ai/oauth2/token"},
+                "redirect_uri": "http://127.0.0.1:56121/callback",
+            }
+        },
+    ))
+    _write(profile_env["profile"] / "auth.json", _make_auth_store(pool={}, providers={}))
+
+    def _refresh_xai(access_token: str, refresh_token: str):
+        assert access_token == "access-old"
+        assert refresh_token == "refresh-old"
+        return {
+            "access_token": "access-new",
+            "refresh_token": "refresh-new",
+            "last_refresh": "2026-05-26T17:00:00Z",
+        }
+
+    monkeypatch.setattr(auth_mod, "refresh_xai_oauth_pure", _refresh_xai)
+
+    pool = load_pool("xai-oauth")
+    inherited = pool.entries()[0]
+    assert inherited.id == "global-xai"
+    pool._current_id = inherited.id
+
+    refreshed = pool.try_refresh_current()
+
+    assert refreshed is not None
+    assert refreshed.access_token == "access-new"
+    assert refreshed.refresh_token == "refresh-new"
+
+    global_data = json.loads((profile_env["global"] / "auth.json").read_text())
+    global_tokens = global_data["providers"]["xai-oauth"]["tokens"]
+    assert global_tokens["access_token"] == "access-new"
+    assert global_tokens["refresh_token"] == "refresh-new"
+    global_pool_entry = global_data["credential_pool"]["xai-oauth"][0]
+    assert global_pool_entry["access_token"] == "access-new"
+    assert global_pool_entry["refresh_token"] == "refresh-new"
+    assert "borrowed_from_global" not in global_pool_entry
+    assert "origin_auth_path" not in global_pool_entry
+
+    profile_data = json.loads((profile_env["profile"] / "auth.json").read_text())
+    assert "xai-oauth" not in profile_data.get("credential_pool", {})
+    assert "xai-oauth" not in profile_data.get("providers", {})
