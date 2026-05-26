@@ -11,6 +11,7 @@ import uuid
 import re
 from dataclasses import dataclass, fields, replace
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from hermes_constants import OPENROUTER_BASE_URL
@@ -122,6 +123,7 @@ _EXTRA_KEYS = frozenset({
     "token_type", "scope", "client_id", "portal_base_url", "obtained_at",
     "expires_in", "agent_key_id", "agent_key_expires_in", "agent_key_reused",
     "agent_key_obtained_at", "tls", "secret_source", "secret_fingerprint",
+    "borrowed_from_global", "origin_auth_path", "origin_home",
 })
 
 
@@ -332,6 +334,77 @@ def _normalize_error_context(error_context: Optional[Dict[str, Any]]) -> Dict[st
     return normalized
 
 
+_GLOBAL_FALLBACK_METADATA_KEYS = frozenset({
+    "borrowed_from_global",
+    "origin_auth_path",
+    "origin_home",
+})
+
+
+def _entry_borrowed_from_global(entry: PooledCredential) -> bool:
+    return bool(entry.extra.get("borrowed_from_global")) and bool(entry.extra.get("origin_auth_path"))
+
+
+def _entry_origin_auth_path(entry: PooledCredential) -> Optional[Path]:
+    raw = entry.extra.get("origin_auth_path")
+    if not raw:
+        return None
+    try:
+        return Path(str(raw)).expanduser()
+    except Exception:
+        return None
+
+
+def _entry_disk_payload(entry: PooledCredential) -> Dict[str, Any]:
+    payload = entry.to_dict()
+    for key in _GLOBAL_FALLBACK_METADATA_KEYS:
+        payload.pop(key, None)
+    return payload
+
+
+def _load_auth_store_for_entry(entry: PooledCredential) -> Tuple[Dict[str, Any], Optional[Path]]:
+    """Load the auth store that owns ``entry``.
+
+    Entries inherited from a profile-global fallback carry ``origin_auth_path``;
+    those must sync/read/write against the root store, not the active profile.
+    """
+    origin_auth_path = _entry_origin_auth_path(entry)
+    if origin_auth_path is not None:
+        auth_store = _load_auth_store(origin_auth_path)
+        return auth_store, origin_auth_path
+    return _load_auth_store(), None
+
+
+
+def _write_credential_pool_at_path(provider: str, entries: List[PooledCredential], auth_file: Path) -> Path:
+    with auth_mod._auth_store_lock_for_path(auth_file):
+        auth_store = _load_auth_store(auth_file)
+        pool = auth_store.get("credential_pool")
+        if not isinstance(pool, dict):
+            pool = {}
+            auth_store["credential_pool"] = pool
+        payloads = [_entry_disk_payload(entry) for entry in entries]
+        if payloads:
+            pool[provider] = payloads
+        else:
+            pool.pop(provider, None)
+            if not pool:
+                auth_store.pop("credential_pool", None)
+        return _save_auth_store(auth_store, auth_file=auth_file)
+
+
+def _remove_local_credential_pool(provider: str) -> None:
+    with _auth_store_lock():
+        auth_store = _load_auth_store()
+        pool = auth_store.get("credential_pool")
+        if not isinstance(pool, dict) or provider not in pool:
+            return
+        pool.pop(provider, None)
+        if not pool:
+            auth_store.pop("credential_pool", None)
+        _save_auth_store(auth_store)
+
+
 def _exhausted_until(entry: PooledCredential) -> Optional[float]:
     if entry.last_status != STATUS_EXHAUSTED:
         return None
@@ -478,9 +551,32 @@ class CredentialPool:
                 return
 
     def _persist(self) -> None:
+        global_entries_by_path: Dict[Path, List[PooledCredential]] = {}
+        local_entries: List[PooledCredential] = []
+        for entry in self._entries:
+            origin_auth_path = _entry_origin_auth_path(entry) if _entry_borrowed_from_global(entry) else None
+            if origin_auth_path is not None:
+                global_entries_by_path.setdefault(origin_auth_path, []).append(entry)
+            else:
+                local_entries.append(entry)
+
+        for origin_auth_path, entries in global_entries_by_path.items():
+            _write_credential_pool_at_path(self.provider, entries, origin_auth_path)
+
+        if global_entries_by_path:
+            if local_entries:
+                write_credential_pool(
+                    self.provider,
+                    [_entry_disk_payload(entry) for entry in local_entries],
+                )
+            else:
+                # Keep inherited/global-only providers profile-shadow-free.
+                _remove_local_credential_pool(self.provider)
+            return
+
         write_credential_pool(
             self.provider,
-            [entry.to_dict() for entry in self._entries],
+            [_entry_disk_payload(entry) for entry in self._entries],
         )
 
     def _is_terminal_auth_failure(
@@ -594,8 +690,9 @@ class CredentialPool:
         if self.provider != "openai-codex" or entry.source != "device_code":
             return entry
         try:
-            with _auth_store_lock():
-                auth_store = _load_auth_store()
+            auth_file = _entry_origin_auth_path(entry)
+            with auth_mod._auth_store_lock_for_path(auth_file):
+                auth_store, _ = _load_auth_store_for_entry(entry)
                 state = _load_provider_state(auth_store, "openai-codex")
             if not isinstance(state, dict):
                 return entry
@@ -655,8 +752,9 @@ class CredentialPool:
         if self.provider != "xai-oauth" or entry.source != "loopback_pkce":
             return entry
         try:
-            with _auth_store_lock():
-                auth_store = _load_auth_store()
+            auth_file = _entry_origin_auth_path(entry)
+            with auth_mod._auth_store_lock_for_path(auth_file):
+                auth_store, _ = _load_auth_store_for_entry(entry)
                 state = _load_provider_state(auth_store, "xai-oauth")
             if not isinstance(state, dict):
                 return entry
@@ -796,8 +894,9 @@ class CredentialPool:
         if entry.source not in {"device_code", "loopback_pkce"}:
             return
         try:
-            with _auth_store_lock():
-                auth_store = _load_auth_store()
+            auth_file = _entry_origin_auth_path(entry)
+            with auth_mod._auth_store_lock_for_path(auth_file):
+                auth_store, target_auth_file = _load_auth_store_for_entry(entry)
                 if self.provider == "nous":
                     state = _load_provider_state(auth_store, "nous")
                     if state is None:
@@ -852,7 +951,7 @@ class CredentialPool:
                 else:
                     return
 
-                _save_auth_store(auth_store)
+                _save_auth_store(auth_store, auth_file=target_auth_file)
         except Exception as exc:
             logger.debug("Failed to sync %s pool entry back to auth store: %s", self.provider, exc)
 
@@ -1012,8 +1111,9 @@ class CredentialPool:
                         "xAI OAuth refresh token is terminally invalid; clearing local token state"
                     )
                     try:
-                        with _auth_store_lock():
-                            auth_store = _load_auth_store()
+                        auth_file = _entry_origin_auth_path(entry)
+                        with auth_mod._auth_store_lock_for_path(auth_file):
+                            auth_store, target_auth_file = _load_auth_store_for_entry(entry)
                             state = _load_provider_state(auth_store, "xai-oauth") or {}
                             if isinstance(state, dict):
                                 tokens = state.get("tokens") or {}
@@ -1033,7 +1133,7 @@ class CredentialPool:
                                             "at": datetime.now(timezone.utc).isoformat(),
                                         }
                                         _save_provider_state(auth_store, "xai-oauth", state)
-                                        _save_auth_store(auth_store)
+                                        _save_auth_store(auth_store, auth_file=target_auth_file)
                     except Exception as clear_exc:
                         logger.debug(
                             "Failed to clear terminal xAI OAuth state: %s", clear_exc
@@ -1078,8 +1178,9 @@ class CredentialPool:
                         "Codex OAuth refresh token is terminally invalid; clearing local token state"
                     )
                     try:
-                        with _auth_store_lock():
-                            auth_store = _load_auth_store()
+                        auth_file = _entry_origin_auth_path(entry)
+                        with auth_mod._auth_store_lock_for_path(auth_file):
+                            auth_store, target_auth_file = _load_auth_store_for_entry(entry)
                             state = _load_provider_state(auth_store, "openai-codex") or {}
                             if isinstance(state, dict):
                                 tokens = state.get("tokens") or {}
@@ -1099,7 +1200,7 @@ class CredentialPool:
                                             "at": datetime.now(timezone.utc).isoformat(),
                                         }
                                         _save_provider_state(auth_store, "openai-codex", state)
-                                        _save_auth_store(auth_store)
+                                        _save_auth_store(auth_store, auth_file=target_auth_file)
                     except Exception as clear_exc:
                         logger.debug(
                             "Failed to clear terminal Codex OAuth state: %s", clear_exc
