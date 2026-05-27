@@ -188,6 +188,31 @@ def should_require_auth(host: str, allow_public: bool) -> bool:
     return (host not in _LOOPBACK_HOST_VALUES) and (not allow_public)
 
 
+def _host_only_from_header(host_header: str) -> str:
+    """Normalize a Host header or configured hostname to host-only form."""
+    if not host_header:
+        return ""
+    h = host_header.strip()
+    if "://" in h:
+        h = urllib.parse.urlparse(h).netloc
+    if h.startswith("["):
+        close = h.find("]")
+        host_only = h[1:close] if close != -1 else h.strip("[]")
+    else:
+        host_only = h.rsplit(":", 1)[0] if ":" in h else h
+    return host_only.lower().rstrip(".")
+
+
+def _dashboard_extra_allowed_hosts() -> frozenset[str]:
+    """Exact extra dashboard hosts allowed when proxied by trusted local tools."""
+    raw = os.environ.get("HERMES_DASHBOARD_ALLOWED_HOSTS", "")
+    return frozenset(
+        host
+        for value in raw.split(",")
+        if (host := _host_only_from_header(value))
+    )
+
+
 def _is_accepted_host(host_header: str, bound_host: str) -> bool:
     """True if the Host header targets the interface we bound to.
 
@@ -197,25 +222,12 @@ def _is_accepted_host(host_header: str, bound_host: str) -> bool:
     - Any host when bound to 0.0.0.0 (explicit opt-in to non-loopback,
       no protection possible at this layer)
     """
-    if not host_header:
+    host_only = _host_only_from_header(host_header)
+    if not host_only:
         return False
-    # Strip port suffix. IPv6 addresses use bracket notation:
-    #   [::1]         — no port
-    #   [::1]:9119    — with port
-    # Plain hosts/v4:
-    #   localhost:9119
-    #   127.0.0.1:9119
-    h = host_header.strip()
-    if h.startswith("["):
-        # IPv6 bracketed — port (if any) follows "]:"
-        close = h.find("]")
-        if close != -1:
-            host_only = h[1:close]  # strip brackets
-        else:
-            host_only = h.strip("[]")
-    else:
-        host_only = h.rsplit(":", 1)[0] if ":" in h else h
-    host_only = host_only.lower()
+
+    if host_only in _dashboard_extra_allowed_hosts():
+        return True
 
     # 0.0.0.0 bind means operator explicitly opted into all-interfaces
     # (requires --insecure per web_server.start_server). No Host-layer
