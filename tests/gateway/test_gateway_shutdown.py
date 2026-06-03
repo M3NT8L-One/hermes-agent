@@ -145,7 +145,9 @@ async def test_gateway_stop_systemd_service_restart_exits_cleanly(tmp_path, monk
     monkeypatch.setenv("INVOCATION_ID", "systemd-test")
     runner._launch_systemd_restart_shortcut = MagicMock()
 
-    with patch("gateway.status.remove_pid_file"), patch("gateway.status.write_runtime_status"):
+    # Patch platform to non-darwin so INVOCATION_ID triggers the clean 0 path
+    # (darwin always uses nonzero SERVICE_RESTART_EXIT_CODE for launchd KeepAlive).
+    with patch("gateway.run.sys.platform", "linux"), patch("gateway.status.remove_pid_file"), patch("gateway.status.write_runtime_status"):
         await runner.stop(restart=True, service_restart=True)
 
     runner._launch_systemd_restart_shortcut.assert_called_once_with()

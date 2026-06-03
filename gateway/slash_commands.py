@@ -27,7 +27,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional, Union
+from typing import Any, Optional, Union, cast
 
 from agent.account_usage import fetch_account_usage, render_account_usage_lines
 from agent.i18n import t
@@ -51,33 +51,47 @@ logger = logging.getLogger("gateway.run")
 _RESET_CLEANUP_TIMEOUT_S = 30.0
 
 
-def _model_switch_skew_guard() -> Optional[str]:
-    """Refuse a model switch when the gateway is running stale code.
+def _model_switch_skew_guard() -> str | None:
+    """Return a user-facing refusal if the running gateway code is stale.
 
-    A long-lived gateway holds its modules in memory from boot. If the checkout
-    changed underneath it (e.g. a manual ``git pull``), switching models can hit
-    a first-time lazy import on a new code path and crash on a stale cached
-    dependency — the cryptic ``cannot import name 'env_float' from 'utils'``.
-    Detect the drift and tell the user to restart instead.
-
-    Intentionally scoped to model switching — the known, highest-risk trigger.
-    Any first-time lazy import on a stale process is technically exposed; we
-    don't guard every import site, only this one.
+    The gateway is long-lived.  After a source update, lazy imports in /model
+    can mix fresh on-disk modules with stale in-memory dependencies.  Refuse
+    the switch with a clear restart instruction instead of surfacing a cryptic
+    import error.
     """
-    from gateway.code_skew import detect_code_skew
+    try:
+        from gateway.code_skew import detect_code_skew
 
-    skew = detect_code_skew()
+        skew = detect_code_skew()
+    except Exception:
+        return None
     if not skew:
         return None
     boot_rev, disk_rev = skew
-    return t(
-        "gateway.model.error_prefix",
-        error=(
-            f"This gateway is running code from {boot_rev} but the checkout on "
-            f"disk is now {disk_rev}. Switching models would risk a stale-module "
-            f"crash — restart the gateway to load the new code: hermes gateway restart"
-        ),
+    return (
+        "⚠️ Hermes gateway code changed since this process started "
+        f"(running {boot_rev}, disk {disk_rev}). "
+        "Run `hermes gateway restart` and then retry `/model`."
     )
+
+
+def _consume_auto_reset_for_model_switch(runner: Any, source: SessionSource) -> None:
+    """Consume a pending auto-reset marker before storing a model override.
+
+    A typed/picker /model command can be the first action after an automatic
+    session reset.  If the flag remains set, the next normal message treats it
+    as an unconsumed reset and wipes the freshly stored model override.
+    """
+    try:
+        session_entry = runner.session_store.get_or_create_session(source)
+        if getattr(session_entry, "was_auto_reset", False):
+            session_entry.was_auto_reset = False
+            session_entry.auto_reset_reason = None
+            save = getattr(runner.session_store, "_save", None)
+            if callable(save):
+                save()
+    except Exception:
+        logger.debug("Failed to consume auto-reset marker for /model", exc_info=True)
 
 
 class GatewaySlashCommandsMixin:
@@ -913,7 +927,7 @@ class GatewaySlashCommandsMixin:
 
     async def _handle_restart_command(self, event: MessageEvent) -> Union[str, EphemeralReply]:
         """Handle /restart command - drain active work, then restart the gateway."""
-        from gateway.run import _hermes_home
+        from gateway.run import _hermes_home, _is_macos_launchd_service_process
         # Defensive idempotency check: if the previous gateway process
         # recorded this same /restart (same platform + update_id) and the new
         # process is seeing it *again*, this is a re-delivery caused by PTB's
@@ -993,21 +1007,16 @@ class GatewaySlashCommandsMixin:
         active_agents = self._running_agent_count()
         # When running under a service manager (systemd/launchd) or inside a
         # Docker/Podman container, use the service restart path: exit with
-        # code 75 so the service manager / container restart policy restarts
-        # us.  The detached subprocess approach (setsid + bash) doesn't work
-        # under systemd (KillMode=mixed kills the cgroup) or Docker (tini
-        # exits when the gateway dies, taking the detached helper with it).
-        # systemd sets INVOCATION_ID; launchd sets XPC_SERVICE_NAME to the
-        # job label.  Without the launchd check, macOS /restart takes the
-        # detached path and exits 0, which KeepAlive.SuccessfulExit=false
-        # treats as a deliberate stop — the gateway stays dead until next
-        # login.  Interactive macOS shells inherit XPC_SERVICE_NAME=0, so
-        # "0" must count as not-under-launchd.
-        _under_service = bool(os.environ.get("INVOCATION_ID")) or os.environ.get(
-            "XPC_SERVICE_NAME", "0"
-        ) not in ("", "0")
+        # code 75/clean service semantics so the service manager / container
+        # restart policy restarts us. The detached subprocess approach
+        # (setsid + bash) doesn't work under systemd (KillMode=mixed kills
+        # the cgroup), launchd-managed macOS services (clean exit does not
+        # relaunch with KeepAlive.SuccessfulExit=false), or Docker (tini exits
+        # when the gateway dies, taking the detached helper with it).
+        _under_systemd_service = bool(os.environ.get("INVOCATION_ID"))  # systemd sets this
+        _under_launchd_service = _is_macos_launchd_service_process()
         _in_container = os.path.exists("/.dockerenv") or os.path.exists("/run/.containerenv")
-        if _under_service or _in_container:
+        if _under_systemd_service or _under_launchd_service or _in_container:
             self.request_restart(detached=False, via_service=True)
         else:
             self.request_restart(detached=True, via_service=False)
@@ -1124,6 +1133,10 @@ class GatewaySlashCommandsMixin:
         )
         from hermes_cli.providers import get_label
 
+        skew_warning = _model_switch_skew_guard()
+        if skew_warning:
+            return skew_warning
+
         raw_args = event.get_command_args().strip()
 
         # Parse --provider, --global, --session, and --refresh flags
@@ -1195,11 +1208,8 @@ class GatewaySlashCommandsMixin:
 
             if has_picker:
                 try:
-                    # Offload blocking provider-listing (can fall through to a
-                    # synchronous urllib HTTP fetch on a stale cache) off the
-                    # event loop so the gateway doesn't freeze. See #41289.
                     providers = await asyncio.to_thread(
-                        list_picker_providers,
+                        cast(Any, list_picker_providers),
                         current_provider=current_provider,
                         current_base_url=current_base_url,
                         current_model=current_model,
@@ -1220,6 +1230,7 @@ class GatewaySlashCommandsMixin:
                     _cur_provider = current_provider
                     _cur_base_url = current_base_url
                     _cur_api_key = current_api_key
+                    _source = source
 
                     async def _on_model_selected(
                         _chat_id: str, model_id: str, provider_slug: str
@@ -1324,6 +1335,7 @@ class GatewaySlashCommandsMixin:
                             f"via {result.provider_label or result.target_provider}. "
                             f"Adjust your self-identification accordingly.]"
                         )
+                        _consume_auto_reset_for_model_switch(_self, _source)
                         _self._session_model_overrides[_session_key] = {
                             "model": result.new_model,
                             "provider": result.target_provider,
@@ -1424,10 +1436,8 @@ class GatewaySlashCommandsMixin:
             lines = [t("gateway.model.current_label", model=current_model or "unknown", provider=provider_label), ""]
 
             try:
-                # Offload blocking provider-listing off the event loop so the
-                # gateway doesn't freeze on a stale-cache HTTP fetch. See #41289.
                 providers = await asyncio.to_thread(
-                    list_authenticated_providers,
+                    cast(Any, list_authenticated_providers),
                     current_provider=current_provider,
                     current_base_url=current_base_url,
                     current_model=current_model,
@@ -1558,6 +1568,7 @@ class GatewaySlashCommandsMixin:
             )
 
             # Store session override so next agent creation uses the new model
+            _consume_auto_reset_for_model_switch(self, source)
             self._session_model_overrides[session_key] = {
                 "model": result.new_model,
                 "provider": result.target_provider,
