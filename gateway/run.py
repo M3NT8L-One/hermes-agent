@@ -1759,6 +1759,42 @@ from gateway.whatsapp_identity import (
 logger = logging.getLogger(__name__)
 
 
+def _get_gateway_launchd_label() -> str:
+    """Return the launchd label used by the Hermes gateway service."""
+    from hermes_cli.gateway import get_launchd_label
+
+    return get_launchd_label()
+
+
+def _is_macos_launchd_service_process() -> bool:
+    """Return True when this gateway PID is the loaded macOS launchd service."""
+    try:
+        xpc_service_name = str(os.environ.get("XPC_SERVICE_NAME") or "").strip()
+        if xpc_service_name and xpc_service_name != "0" and xpc_service_name == _get_gateway_launchd_label():
+            return True
+    except Exception as exc:
+        logger.debug("macOS launchd env detection failed: %s", exc)
+
+    if sys.platform != "darwin":
+        return False
+    try:
+        import subprocess
+
+        current_pid = os.getpid()
+        result = subprocess.run(
+            ["launchctl", "list", _get_gateway_launchd_label()],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        if result.returncode != 0:
+            return False
+        return bool(re.search(rf'"PID"\s*=\s*{current_pid}\s*;', result.stdout or ""))
+    except Exception as exc:
+        logger.debug("macOS launchd service detection failed: %s", exc)
+        return False
+
+
 # Sentinel placed into _running_agents immediately when a session starts
 # processing, *before* any await.  Prevents a second message for the same
 # session from bypassing the "already running" guard during the async gap
