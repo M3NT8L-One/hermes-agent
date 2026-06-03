@@ -751,7 +751,7 @@ class GatewaySlashCommandsMixin:
 
     async def _handle_restart_command(self, event: MessageEvent) -> Union[str, EphemeralReply]:
         """Handle /restart command - drain active work, then restart the gateway."""
-        from gateway.run import _hermes_home
+        from gateway.run import _hermes_home, _is_macos_launchd_service_process
         # Defensive idempotency check: if the previous gateway process
         # recorded this same /restart (same platform + update_id) and the new
         # process is seeing it *again*, this is a re-delivery caused by PTB's
@@ -831,13 +831,16 @@ class GatewaySlashCommandsMixin:
         active_agents = self._running_agent_count()
         # When running under a service manager (systemd/launchd) or inside a
         # Docker/Podman container, use the service restart path: exit with
-        # code 75 so the service manager / container restart policy restarts
-        # us.  The detached subprocess approach (setsid + bash) doesn't work
-        # under systemd (KillMode=mixed kills the cgroup) or Docker (tini
-        # exits when the gateway dies, taking the detached helper with it).
-        _under_service = bool(os.environ.get("INVOCATION_ID"))  # systemd sets this
+        # code 75/clean service semantics so the service manager / container
+        # restart policy restarts us. The detached subprocess approach
+        # (setsid + bash) doesn't work under systemd (KillMode=mixed kills
+        # the cgroup), launchd-managed macOS services (clean exit does not
+        # relaunch with KeepAlive.SuccessfulExit=false), or Docker (tini exits
+        # when the gateway dies, taking the detached helper with it).
+        _under_systemd_service = bool(os.environ.get("INVOCATION_ID"))  # systemd sets this
+        _under_launchd_service = _is_macos_launchd_service_process()
         _in_container = os.path.exists("/.dockerenv") or os.path.exists("/run/.containerenv")
-        if _under_service or _in_container:
+        if _under_systemd_service or _under_launchd_service or _in_container:
             self.request_restart(detached=False, via_service=True)
         else:
             self.request_restart(detached=True, via_service=False)
