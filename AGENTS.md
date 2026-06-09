@@ -393,10 +393,10 @@ CommandDef("mycommand", "Description of what it does", "Session",
 elif canonical == "mycommand":
     self._handle_mycommand(cmd_original)
 ```
-3. If the command is available in the gateway, add a handler in `gateway/run.py`:
+3. If the command is available in the gateway, add or update the gateway slash-command handler in `gateway/slash_commands.py`. Keep `gateway/run.py` as the runtime/orchestration surface and use shared helpers there only when the command needs gateway process state:
 ```python
 if canonical == "mycommand":
-    return await self._handle_mycommand(event)
+    return await _handle_mycommand(ctx, event, args)
 ```
 4. For persistent settings, use `save_config_value()` in `cli.py`
 
