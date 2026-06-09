@@ -1127,18 +1127,10 @@ Do the legacy thing.
 class TestSkillViewCollisionDetection:
     """Regression tests for skill_view name collision handling.
 
-    When a skill name resolves to multiple paths across the local skills
-    dir and external_dirs, skill_view must refuse to guess. Silent
-    shadowing — where ``/skills`` shows the local version but
-    ``skill_view`` loads the external one — is the bug class this guards
-    against. Reproduces with `skills.external_dirs` registered in
-    config.yaml and a same-name skill nested under a category locally.
-
-    Adapted from a regression suite originally proposed by @polkn in PR
-    #6136 (which used local-first precedence). The collision-refusal
-    behavior preserves the same protection without silently picking a
-    side, and gives the user an actionable hint (use the categorized
-    path) to recover.
+    When a skill name resolves to both profile-local and external paths,
+    skill_view must match the skill index and prefer the profile-local copy.
+    Same-priority duplicates still fail closed because there is no
+    unambiguous owner.
     """
 
     def _patch_dirs(self, local_dir, external_dirs):
@@ -1151,9 +1143,9 @@ class TestSkillViewCollisionDetection:
             ),
         )
 
-    def test_nested_local_collides_with_top_level_external(self, tmp_path):
+    def test_nested_local_takes_precedence_over_top_level_external(self, tmp_path):
         """The original bug scenario: nested local + top-level external,
-        same name. Now refuses with both paths surfaced."""
+        same name. Profile-local now wins, matching the skill index."""
         local_dir = tmp_path / "local"
         external_dir = tmp_path / "external"
         local_dir.mkdir()
@@ -1172,18 +1164,13 @@ class TestSkillViewCollisionDetection:
             raw = skill_view("explore-codebase")
 
         result = json.loads(raw)
-        assert result["success"] is False
-        assert "Ambiguous skill name 'explore-codebase'" in result["error"]
-        assert "matches" in result
-        assert len(result["matches"]) == 2
-        # Both paths surfaced
-        assert any("foundations/runtime" in p for p in result["matches"])
-        assert any("external" in p for p in result["matches"])
-        assert "hint" in result
+        assert result["success"] is True
+        assert "LOCAL VERSION" in result["content"]
+        assert "EXTERNAL VERSION" not in result["content"]
 
     def test_top_level_local_collides_with_external(self, tmp_path):
         """Top-level local + top-level external with the same name also
-        refuses — same-name shadowing is ambiguous regardless of nesting."""
+        resolves to the profile-local skill."""
         local_dir = tmp_path / "local"
         external_dir = tmp_path / "external"
         local_dir.mkdir()
@@ -1197,13 +1184,12 @@ class TestSkillViewCollisionDetection:
             raw = skill_view("shared-name")
 
         result = json.loads(raw)
-        assert result["success"] is False
-        assert "Ambiguous" in result["error"]
-        assert len(result["matches"]) == 2
+        assert result["success"] is True
+        assert "LOCAL VERSION" in result["content"]
+        assert "EXTERNAL VERSION" not in result["content"]
 
     def test_collision_resolvable_via_categorized_path(self, tmp_path):
-        """User can recover from a collision by passing the full
-        categorized path — the bare name is ambiguous, the path is not."""
+        """The categorized path still resolves to the profile-local skill."""
         local_dir = tmp_path / "local"
         external_dir = tmp_path / "external"
         local_dir.mkdir()
