@@ -39,6 +39,10 @@ class TestUserSystemdPrivateSocketPreflight:
 
 
 class TestSystemdServiceRefresh:
+    @pytest.fixture(autouse=True)
+    def _skip_user_systemd_preflight(self, monkeypatch):
+        monkeypatch.setattr(gateway_cli, "_preflight_user_systemd", lambda: None)
+
     def test_systemd_install_repairs_outdated_unit_without_force(self, tmp_path, monkeypatch):
         unit_path = tmp_path / "hermes-gateway.service"
         unit_path.write_text("old unit\n", encoding="utf-8")
@@ -1244,6 +1248,10 @@ class TestGatewayServiceDetection:
         assert gateway_cli._is_service_running() is False
 
 class TestGatewaySystemServiceRouting:
+    @pytest.fixture(autouse=True)
+    def _skip_user_systemd_preflight(self, monkeypatch):
+        monkeypatch.setattr(gateway_cli, "_preflight_user_systemd", lambda: None)
+
     def test_systemd_restart_gracefully_restarts_running_service_and_waits(self, monkeypatch, capsys):
         calls = []
 
