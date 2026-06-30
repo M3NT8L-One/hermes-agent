@@ -248,6 +248,31 @@ class TestSubdirectoryHintTracker:
         )
         assert result is None
 
+    def test_shell_words_that_look_like_tilde_paths_do_not_crash_without_home(
+        self, project
+    ):
+        """Prose tokens such as approximate counts must not abort tool execution."""
+        tracker = SubdirectoryHintTracker(working_dir=str(project))
+        original_expanduser = Path.expanduser
+
+        def expanduser_with_missing_home(path):
+            if str(path).startswith("~"):
+                raise RuntimeError("Could not determine home directory.")
+            return original_expanduser(path)
+
+        with patch.object(Path, "expanduser", expanduser_with_missing_home):
+            result = tracker.check_tool_call(
+                "terminal",
+                {
+                    "command": (
+                        "printf Library has ~1.9M chars and "
+                        "source_hash_drift 75 warnings"
+                    )
+                },
+            )
+
+        assert result is None
+
 
 class TestPermissionErrorHandling:
     """Regression tests for PermissionError in filesystem checks (ref #6214)."""
