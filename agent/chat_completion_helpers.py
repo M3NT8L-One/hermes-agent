@@ -1352,6 +1352,44 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             agent._transport_cache.clear()
         agent._fallback_activated = True
 
+        # Fallback entries may intentionally require different runtime knobs
+        # than the primary model.  Example: Team A-2 keeps xAI Composer clean
+        # (no explicit reasoning/service_tier fields on the primary route) but
+        # wants Codex GPT-5.5 fallback to run high reasoning + priority/fast.
+        # These overrides are applied only after the provider actually falls
+        # back, so they cannot leak into xAI requests.
+        fb_reasoning_effort = str(fb.get("reasoning_effort") or "").strip()
+        if fb_reasoning_effort:
+            try:
+                from hermes_constants import parse_reasoning_effort
+
+                parsed_reasoning = parse_reasoning_effort(fb_reasoning_effort)
+                if parsed_reasoning is not None:
+                    agent.reasoning_config = parsed_reasoning
+            except Exception as exc:
+                logger.debug(
+                    "Fallback %s/%s reasoning_effort=%r ignored: %s",
+                    fb_provider, fb_model, fb_reasoning_effort, exc,
+                )
+
+        fb_service_tier = str(fb.get("service_tier") or "").strip().lower()
+        if fb_service_tier:
+            if fb_service_tier in {"fast", "priority", "on", "true", "1"}:
+                agent.service_tier = "priority"
+                try:
+                    from hermes_cli.models import resolve_fast_mode_overrides
+
+                    agent.request_overrides = resolve_fast_mode_overrides(fb_model) or {}
+                except Exception as exc:
+                    agent.request_overrides = {}
+                    logger.debug(
+                        "Fallback %s/%s service_tier=%r override ignored: %s",
+                        fb_provider, fb_model, fb_service_tier, exc,
+                    )
+            elif fb_service_tier in {"normal", "off", "false", "0", "none"}:
+                agent.service_tier = None
+                agent.request_overrides = {}
+
         # Rebind the credential pool to the fallback provider when the provider
         # changes.  Keeping the primary pool attached would make downstream
         # recovery (rate_limit / billing / auth) mutate the wrong credential

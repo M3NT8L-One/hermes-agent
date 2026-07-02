@@ -98,6 +98,23 @@ def _get_x_search_retries() -> int:
         return DEFAULT_X_SEARCH_RETRIES
 
 
+def _apply_x_search_request_options(payload: Dict[str, Any]) -> None:
+    """Merge optional x_search config knobs into the Responses API payload."""
+    cfg = _load_x_search_config()
+    extra_body = cfg.get("extra_body")
+    if isinstance(extra_body, dict):
+        for key, value in extra_body.items():
+            if isinstance(value, dict) and isinstance(payload.get(key), dict):
+                merged = dict(payload[key])
+                merged.update(value)
+                payload[key] = merged
+            else:
+                payload[key] = value
+    reasoning_effort = str(cfg.get("reasoning_effort") or "").strip().lower()
+    if reasoning_effort and "reasoning" not in payload:
+        payload["reasoning"] = {"effort": reasoning_effort}
+
+
 # ---------------------------------------------------------------------------
 # Credential resolution
 # ---------------------------------------------------------------------------
@@ -324,6 +341,7 @@ def x_search_tool(
             "tools": [tool_def],
             "store": False,
         }
+        _apply_x_search_request_options(payload)
 
         timeout_seconds = _get_x_search_timeout_seconds()
         max_retries = _get_x_search_retries()
