@@ -6389,6 +6389,34 @@ class TestFallbackAnthropicProvider:
         assert agent.api_mode == "chat_completions"
         assert agent.client is mock_client
 
+    def test_fallback_entry_applies_reasoning_and_fast_only_after_switch(self, agent):
+        agent._fallback_activated = False
+        agent.reasoning_config = None
+        agent.service_tier = None
+        agent.request_overrides = {}
+        agent._fallback_model = {
+            "provider": "openai-codex",
+            "model": "gpt-5.5",
+            "reasoning_effort": "high",
+            "service_tier": "fast",
+        }
+        agent._fallback_chain = [agent._fallback_model]
+        agent._fallback_index = 0
+
+        mock_client = MagicMock()
+        mock_client.base_url = "https://chatgpt.com/backend-api/codex"
+        mock_client.api_key = "codex-token"
+
+        with patch("agent.auxiliary_client.resolve_provider_client", return_value=(mock_client, None)):
+            result = agent._try_activate_fallback()
+
+        assert result is True
+        assert agent.provider == "openai-codex"
+        assert agent.model == "gpt-5.5"
+        assert agent.reasoning_config == {"enabled": True, "effort": "high"}
+        assert agent.service_tier == "priority"
+        assert agent.request_overrides == {"service_tier": "priority"}
+
 
 def test_aiagent_uses_copilot_acp_client():
     with (
