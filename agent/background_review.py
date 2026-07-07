@@ -168,6 +168,18 @@ _MEMORY_REVIEW_PROMPT = (
     "If nothing is worth saving, just say 'Nothing to save.' and stop."
 )
 
+_BACKGROUND_REVIEW_SKILL_IO_RULE = (
+    "Background-review write protocol (mandatory):\n"
+    "  • Only memory and skill tools are available in this fork. "
+    "read_file, terminal, patch, execute_code, and every other tool "
+    "is denied at runtime — do not attempt them.\n"
+    "  • Before any skill_manage patch, edit, write_file, or "
+    "remove_file, load the exact target in THIS review turn: "
+    "skill_view(name) for SKILL.md; skill_view(name, file_path=...) "
+    "for references/, templates/, or scripts/ paths. Writes without "
+    "that prior skill_view on the same path are refused.\n\n"
+)
+
 _SKILL_REVIEW_PROMPT = (
     "Review the conversation above and update the skill library. Be "
     "ACTIVE — most sessions produce at least one skill update, even if "
@@ -229,7 +241,8 @@ _SKILL_REVIEW_PROMPT = (
     "codename, library-alone name, or 'fix-X / debug-Y / audit-Z-today' "
     "session artifact. If the proposed name only makes sense for "
     "today's task, it's wrong — fall back to (1), (2), or (3).\n\n"
-    "User-preference embedding (important): when the user expressed a "
+    + _BACKGROUND_REVIEW_SKILL_IO_RULE
+    + "User-preference embedding (important): when the user expressed a "
     "style/format/workflow preference, the update belongs in the "
     "SKILL.md body, not just in memory. Memory captures 'who the user "
     "is and what the current situation and state of your operations "
@@ -316,7 +329,8 @@ _COMBINED_REVIEW_PROMPT = (
     "codename, library-alone name, or 'fix-X / debug-Y' session "
     "artifact. If the name only fits today's task, fall back to (1), "
     "(2), or (3).\n\n"
-    "User-preference embedding: when the user complains about how "
+    + _BACKGROUND_REVIEW_SKILL_IO_RULE
+    + "User-preference embedding: when the user complains about how "
     "you handled a task, update the skill that governs that task — "
     "memory alone isn't enough. Memory says 'who the user is and "
     "what the current situation and state of your operations are'; "
