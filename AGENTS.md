@@ -221,6 +221,14 @@ source .venv/bin/activate   # or: source venv/bin/activate
 `$HOME/.hermes/hermes-agent/venv` (for worktrees that share a venv with the
 main checkout).
 
+## Safe Hermes Updates
+
+Hermes upstream moves fast. During a safe update, fetch once, create rollback
+artifacts, rebase/test/push the fetched tip, refresh the editable install, and
+run the smoke set. If `upstream/main` advances by only one or two commits while
+the closeout is already green, document that small delta for the next safe
+update instead of repeatedly chasing a moving target.
+
 ## Project Structure
 
 File counts shift constantly — don't treat the tree below as exhaustive.
