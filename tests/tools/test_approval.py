@@ -57,6 +57,277 @@ class TestApprovalModeParsing:
         assert _normalize_approval_mode(True) == "manual"
 
 
+class TestDelegatedCapabilityGuardIntegration:
+    """Capability policy must run before every contextual approval fast path."""
+
+    @staticmethod
+    def _decision(*, allowed: bool, reason: str = "service_reload"):
+        def callback(command, *, effective_cwd=None, env_type=None):
+            return {
+                "matched": True,
+                "allowed": allowed,
+                "reason": reason,
+                "cwd": effective_cwd,
+                "env_type": env_type,
+            }
+
+        return callback
+
+    def test_capability_allow_runs_in_noninteractive_context_with_actual_cwd(self):
+        seen = []
+
+        def callback(command, *, effective_cwd=None, env_type=None):
+            seen.append((command, effective_cwd, env_type))
+            return {"matched": True, "allowed": True, "reason": "controller"}
+
+        with (
+            mock_patch.object(approval_module, "_is_interactive_cli", return_value=False),
+            mock_patch.object(approval_module, "_is_gateway_approval_context", return_value=False),
+            mock_patch.object(approval_module, "_get_approval_mode", return_value="manual"),
+        ):
+            result = approval_module.check_all_command_guards(
+                "/project/controller repair",
+                "local",
+                capability_callback=callback,
+                effective_cwd="/project",
+            )
+
+        assert result["approved"] is True
+        assert result["capability_approved"] is True
+        assert seen == [("/project/controller repair", "/project", "local")]
+
+    def test_capability_deny_precedes_yolo_and_gateway_queue(self):
+        approval_module._pending.clear()
+        with (
+            mock_patch.object(approval_module, "_is_interactive_cli", return_value=False),
+            mock_patch.object(approval_module, "_is_gateway_approval_context", return_value=True),
+            mock_patch.object(approval_module, "_get_approval_mode", return_value="off"),
+        ):
+            result = approval_module.check_all_command_guards(
+                "launchctl kickstart gui/501/not-allowed",
+                "local",
+                capability_callback=self._decision(
+                    allowed=False, reason="service_target_not_granted"
+                ),
+                effective_cwd="/project",
+            )
+
+        assert result["approved"] is False
+        assert result["capability_denied"] is True
+        assert not approval_module._pending
+
+    def test_isolated_container_does_not_skip_scoped_capability(self):
+        result = approval_module.check_all_command_guards(
+            "/project/controller repair",
+            "docker",
+            capability_callback=self._decision(
+                allowed=False, reason="capability_requires_local_terminal"
+            ),
+            effective_cwd="/project",
+        )
+
+        assert result["approved"] is False
+        assert result["capability_denied"] is True
+
+    def test_hardline_and_user_deny_precede_capability_allow(self):
+        allow = self._decision(allowed=True)
+        hardline = approval_module.check_all_command_guards(
+            "rm -rf /",
+            "local",
+            capability_callback=allow,
+            effective_cwd="/project",
+        )
+        assert hardline["approved"] is False
+        assert hardline.get("hardline") is True
+
+        with mock_patch.object(
+            approval_module, "_match_user_deny_rule", return_value="launchctl *"
+        ):
+            denied = approval_module.check_all_command_guards(
+                "launchctl kickstart gui/501/example",
+                "local",
+                capability_callback=allow,
+                effective_cwd="/project",
+            )
+        assert denied["approved"] is False
+        assert "deny rule" in denied["message"].lower()
+
+    def test_noninteractive_subagent_dangerous_callback_no_longer_bypassed(self):
+        calls = []
+
+        def deny(command, description, **kwargs):
+            calls.append((command, description, kwargs))
+            return "deny"
+
+        deny._hermes_noninteractive_worker_policy = True
+
+        with (
+            mock_patch.object(approval_module, "_is_interactive_cli", return_value=False),
+            mock_patch.object(approval_module, "_is_gateway_approval_context", return_value=False),
+            mock_patch.object(approval_module, "_get_approval_mode", return_value="manual"),
+        ):
+            result = approval_module.check_all_command_guards(
+                "rm -rf /tmp/delegated-worker-test",
+                "local",
+                approval_callback=deny,
+            )
+
+        assert result["approved"] is False
+        assert len(calls) == 1
+
+    def test_worker_policy_precedes_yolo_and_permanent_approvals(self):
+        calls = []
+
+        def deny(command, description, **kwargs):
+            calls.append((command, description, kwargs))
+            return "deny"
+
+        deny._hermes_noninteractive_worker_policy = True
+        with (
+            mock_patch.object(approval_module, "_get_approval_mode", return_value="off"),
+            mock_patch.object(
+                approval_module, "_command_matches_permanent_allowlist", return_value=True
+            ),
+        ):
+            result = approval_module.check_all_command_guards(
+                "rm -rf /tmp/delegated-yolo-test",
+                "local",
+                approval_callback=deny,
+                capability_callback=lambda *args, **kwargs: {
+                    "matched": False,
+                    "allowed": False,
+                    "reason": "ordinary_command",
+                },
+            )
+
+        assert result["approved"] is False
+        assert len(calls) == 1
+
+    def test_legacy_worker_autoapprove_survives_without_scoped_grant(self):
+        def approve(command, description, **kwargs):
+            return "once"
+
+        approve._hermes_noninteractive_worker_policy = True
+        with mock_patch.object(
+            approval_module, "_get_approval_mode", return_value="manual"
+        ):
+            result = approval_module.check_all_command_guards(
+                "rm -rf /tmp/delegated-legacy-test",
+                "local",
+                approval_callback=approve,
+                capability_callback=None,
+            )
+
+        assert result["approved"] is True
+        assert result["subagent_approved"] is True
+
+    def test_worker_policy_sees_tirith_warning_even_under_mode_off(self):
+        calls = []
+
+        def deny(command, description, **kwargs):
+            calls.append((command, description, kwargs))
+            return "deny"
+
+        deny._hermes_noninteractive_worker_policy = True
+        tirith_warning = {
+            "action": "warn",
+            "findings": [
+                {
+                    "rule_id": "delegated-test",
+                    "severity": "HIGH",
+                    "title": "Delegated warning",
+                    "description": "test warning",
+                }
+            ],
+            "summary": "test warning",
+        }
+        with (
+            mock_patch.object(approval_module, "_is_interactive_cli", return_value=False),
+            mock_patch.object(
+                approval_module, "_is_gateway_approval_context", return_value=False
+            ),
+            mock_patch.object(approval_module, "_get_approval_mode", return_value="off"),
+            mock_patch(
+                "tools.tirith_security.check_command_security",
+                return_value=tirith_warning,
+            ),
+        ):
+            result = approval_module.check_all_command_guards(
+                "echo harmless",
+                "local",
+                approval_callback=deny,
+            )
+
+        assert result["approved"] is False
+        assert len(calls) == 1
+
+    def test_cli_subagent_tirith_warning_never_prompts_worker_stdin(self):
+        calls = []
+
+        def deny(command, description, **kwargs):
+            calls.append((command, description, kwargs))
+            return "deny"
+
+        deny._hermes_noninteractive_worker_policy = True
+        tirith_warning = {
+            "action": "warn",
+            "findings": [
+                {
+                    "rule_id": "delegated-cli-test",
+                    "severity": "HIGH",
+                    "title": "Delegated CLI warning",
+                    "description": "test warning",
+                }
+            ],
+            "summary": "test warning",
+        }
+        with (
+            mock_patch.object(approval_module, "_is_interactive_cli", return_value=True),
+            mock_patch.object(
+                approval_module, "_is_gateway_approval_context", return_value=False
+            ),
+            mock_patch.object(approval_module, "_get_approval_mode", return_value="manual"),
+            mock_patch(
+                "tools.tirith_security.check_command_security",
+                return_value=tirith_warning,
+            ),
+            mock_patch("builtins.input", side_effect=AssertionError("must not prompt")),
+        ):
+            result = approval_module.check_all_command_guards(
+                "echo harmless",
+                "local",
+                approval_callback=deny,
+            )
+
+        assert result["approved"] is False
+        assert len(calls) == 1
+
+    def test_gateway_subagent_callback_resolves_before_human_queue(self):
+        calls = []
+        approval_module._pending.clear()
+
+        def deny(command, description, **kwargs):
+            calls.append((command, description, kwargs))
+            return "deny"
+
+        deny._hermes_noninteractive_worker_policy = True
+
+        with (
+            mock_patch.object(approval_module, "_is_interactive_cli", return_value=False),
+            mock_patch.object(approval_module, "_is_gateway_approval_context", return_value=True),
+            mock_patch.object(approval_module, "_get_approval_mode", return_value="manual"),
+        ):
+            result = approval_module.check_all_command_guards(
+                "rm -rf /tmp/delegated-gateway-test",
+                "local",
+                approval_callback=deny,
+            )
+
+        assert result["approved"] is False
+        assert len(calls) == 1
+        assert not approval_module._pending
+
+
 class TestSmartApproval:
     def test_smart_is_the_default_approval_mode(self):
         from hermes_cli.config import DEFAULT_CONFIG

@@ -195,6 +195,13 @@ def reanchor_current_turn_user_idx(messages: List[Any], user_message: Any) -> in
     return fallback
 
 
+def _reset_iteration_budget_for_turn(agent) -> None:
+    """Reset ordinary turns while preserving a delegated mission counter."""
+    if getattr(agent, "_preserve_iteration_budget_across_turns", False):
+        return
+    agent.iteration_budget = IterationBudget(agent.max_iterations)
+
+
 def _compression_made_progress(
     orig_len: int, new_len: int, orig_tokens: int, new_tokens: int
 ) -> bool:
@@ -481,7 +488,7 @@ def build_turn_context(
         agent._compression_warning = None  # send once
 
     # NOTE: _turns_since_memory and _iters_since_skill are NOT reset here.
-    agent.iteration_budget = IterationBudget(agent.max_iterations)
+    _reset_iteration_budget_for_turn(agent)
 
     # Log conversation turn start for debugging/observability.
     _preview_text = summarize_user_message_for_log(user_message)

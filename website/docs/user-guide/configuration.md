@@ -2032,6 +2032,21 @@ delegation:
   # route_classes:                           # Optional opaque per-call routes
   #   fast: {provider: "openrouter", model: "google/gemini-3-flash-preview"}
   #   strong: {provider: "anthropic", model: "claude-opus-4-6", reasoning_effort: "high"}
+  # default_capability_grant: ""              # Prefer explicit per-mission selection
+  # capability_grants:                       # Optional opaque mission authority
+  #   project-maintainer:
+  #     allowed_roots: ["/absolute/project/root"]
+  #     allowed_services: ["ai.example.worker"]
+  #     allowed_operations: [controller, service_reload]
+  #     service_commands: ["/bin/launchctl"]
+  #     controller_commands:
+  #       - argv: ["/absolute/venv/bin/python", "-I", "-S", "/absolute/project/root/scripts/projectctl.py", "repair"]
+  #         flag_options: ["--routine"]
+  #         value_options: ["--mission-id"]
+  #         fixed_value_options: {"--mode": ["paper", "dry-run"]}
+  #         bound_files: ["/absolute/project/root/scripts/projectctl_support.py"]
+  #     max_iterations: 40
+  #     child_timeout_seconds: 1800
   # base_url: "http://localhost:1234/v1"    # Direct OpenAI-compatible endpoint (takes precedence over provider)
   # api_key: "local-key"                    # API key for base_url (falls back to OPENAI_API_KEY)
   # api_mode: ""                            # Wire protocol for base_url: "chat_completions", "codex_responses", or "anthropic_messages". Empty = auto-detect from URL (e.g. /anthropic suffix → anthropic_messages). Set explicitly for non-standard endpoints the heuristic can't detect.
@@ -2043,6 +2058,12 @@ delegation:
 **Subagent provider:model override:** By default, subagents inherit the parent agent's provider and model. Set `delegation.provider` and `delegation.model` to route subagents to a different provider:model pair — e.g., use a cheap/fast model for narrowly-scoped subtasks while your primary agent runs an expensive reasoning model.
 
 **Allowlisted route classes:** For tiered workers, define `delegation.route_classes` and an optional `delegation.default_route_class`. The `delegate_task` tool then exposes only those opaque class names through `route_class` (at the top level or per batch item); it never accepts an arbitrary provider or model. A selected class overlays the top-level delegation route and inherits shared limits such as `max_iterations`, `max_concurrent_children`, and `max_spawn_depth` unless the operator explicitly overrides them inside that class. Existing configs without route classes keep the legacy single-route behavior.
+
+**Scoped mission capability grants:** Define `delegation.capability_grants` to let trusted child missions complete covered maintenance without blocking on dangerous-command prompts. The model sees only opaque grant names; roots, service labels, typed controller schemas, operations, and budgets remain operator-owned config. Prefer explicit per-mission selection and leave `default_capability_grant` empty unless every delegated goal should receive the same authority. Hermes normalizes and content-addresses the selected grant, binds it to the delegated goal, and returns its mission grant ID in child status/results. Nested workers inherit that exact grant and cannot select a broader one.
+
+Supported operations are `controller` and `service_reload`. Controllers require absolute executable/script paths inside `allowed_roots` plus explicit flag, value, repeatable-value, and fixed-value option classes. Optional `bound_files` capture the controller's local dependency closure. Executable, controller, and bound-file SHA-256 values are captured when the grant is resolved and checked again at authorization time, so ordinary drift or symlink retargeting is denied. Python-backed controllers must use the exact `-I -S` prefix before the script; isolated mode plus disabled site initialization prevents virtualenv `.pth` and site hooks from adding an unbound startup dependency. Other interpreted controller runtimes are not accepted; use a direct executable or the isolated Python form. These are point-in-time drift checks, not atomic execution or a same-user security boundary. Generic option values are inert input to the trusted controller; the controller itself must enforce domain rules such as paper-only trading. Service reloads require a configured absolute `launchctl` or `systemctl` executable, exact service labels, a permitted working root, and a strict local restart grammar. Docker, Hermes gateway lifecycle, remote/context options, aliases, wrappers, pipelines, redirects, expansion, globbing, and compound commands never receive typed grant auto-approval.
+
+The typed capability authorizer runs inside the terminal guard after hardline and user deny rules but before CLI, gateway, cron, async, yolo, or non-interactive fast paths, and it is propagated into parallel tool workers. Other dangerous commands remain non-interactively denied for a granted child. Interactive shell/REPL starts and process stdin writes are unavailable while a scoped grant is active; process mutation is limited to that child task's own processes. ACP and Codex app-server delegation routes cannot carry a grant because their tools execute outside this guard. This is scoped auto-approval, not a filesystem or shell sandbox: ordinary commands that do not require approval keep their pre-existing tool authority, including the normal limitations of shell-command classification. A trusted controller is responsible for its own business-domain boundaries. The grant's iteration counter and deadline are shared by a goal and its nested descendants; separate batch goals remain separate missions. `subagent_auto_approve: true` remains as deprecated all-or-nothing compatibility behavior only when no scoped grant is selected.
 
 **Direct endpoint override:** If you want the obvious custom-endpoint path, set `delegation.base_url`, `delegation.api_key`, and `delegation.model`. That sends subagents directly to that OpenAI-compatible endpoint and takes precedence over `delegation.provider`. If `delegation.api_key` is omitted, Hermes falls back to `OPENAI_API_KEY` only.
 

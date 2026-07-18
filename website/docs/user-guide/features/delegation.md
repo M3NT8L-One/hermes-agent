@@ -264,6 +264,7 @@ For **durable execution** that must survive session closure or process restart, 
 - Each subagent gets its **own terminal session** (separate from the parent)
 - Subagents inherit the parent's enabled toolsets; the model cannot select or widen them per call
 - **Nested delegation is opt-in** — only `role="orchestrator"` children can delegate further, and only when `max_spawn_depth` is raised from its default of 1 (flat). Disable globally with `orchestrator_enabled: false`.
+- **Mission authority is scoped** — optional `capability_grant` names resolve to operator-owned roots, services, typed controller schemas, operations, and budgets. Nested workers inherit the same content-addressed grant and cannot broaden it.
 - Leaf subagents **cannot** call: `delegate_task`, `clarify`, `memory`, `send_message`, `cronjob`. Orchestrator subagents retain `delegate_task` but keep the other blocks. Both roles retain `execute_code` (programmatic tool calling) so children can batch mechanical work instead of burning reasoning iterations.
 - **Cancellation follows ownership** — `/stop` or closing/resetting the owning session cancels its background children; synchronous descendants under orchestrators follow their parent's interrupt state
 - Only the final summary enters the parent's context, keeping token usage efficient
@@ -292,6 +293,21 @@ delegation:
   # max_concurrent_children: 3              # Parallel children per batch (default: 3)
   # max_spawn_depth: 1                      # Tree depth (floor 1, no ceiling, default 1 = flat). Raise to 2 to allow orchestrator children to spawn leaves; 3+ for deeper trees.
   # orchestrator_enabled: true              # Disable to force all children to leaf role.
+  # default_capability_grant: ""              # Prefer explicit per-mission selection
+  # capability_grants:
+  #   project-maintainer:
+  #     allowed_roots: [/absolute/project/root]
+  #     allowed_services: [ai.example.worker]
+  #     allowed_operations: [controller, service_reload]
+  #     service_commands: [/bin/launchctl]
+  #     controller_commands:
+  #       - argv: [/absolute/venv/bin/python, -I, -S, /absolute/project/root/scripts/projectctl.py, repair]
+  #         flag_options: [--routine]
+  #         value_options: [--mission-id]
+  #         fixed_value_options: {--mode: [paper, dry-run]}
+  #         bound_files: [/absolute/project/root/scripts/projectctl_support.py]
+  #     max_iterations: 40                  # Shared by this goal + nested descendants
+  #     child_timeout_seconds: 1800          # One inherited mission deadline
   model: "google/gemini-3-flash-preview"             # Optional provider/model override
   provider: "openrouter"                             # Optional built-in provider
   api_mode: anthropic_messages                       # optional; auto-detected from base_url for anthropic_messages endpoints

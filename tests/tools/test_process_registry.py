@@ -1328,6 +1328,50 @@ class TestProcessToolHandler:
         result = json.loads(_handle_process({"action": "unknown_action"}))
         assert "error" in result
 
+    def test_scoped_mission_cannot_mutate_sibling_process(self, monkeypatch):
+        from tools import process_registry as process_module
+        from tools import terminal_tool
+
+        sibling = _make_session(sid="sibling", task_id="parent-task")
+        process_module.process_registry._running[sibling.id] = sibling
+        terminal_tool.set_capability_authorizer(lambda *args, **kwargs: {})
+        try:
+            for action in ("kill", "write", "submit", "close"):
+                result = json.loads(
+                    process_module._handle_process(
+                        {"action": action, "session_id": sibling.id},
+                        task_id="child-task",
+                    )
+                )
+                assert "same child task" in result["error"]
+        finally:
+            terminal_tool.set_capability_authorizer(None)
+            process_module.process_registry._running.pop(sibling.id, None)
+
+    def test_scoped_mission_may_kill_its_own_process(self, monkeypatch):
+        from tools import process_registry as process_module
+        from tools import terminal_tool
+
+        owned = _make_session(sid="owned", task_id="child-task")
+        process_module.process_registry._running[owned.id] = owned
+        terminal_tool.set_capability_authorizer(lambda *args, **kwargs: {})
+        monkeypatch.setattr(
+            process_module.process_registry,
+            "kill_process",
+            lambda session_id: {"status": "killed", "session_id": session_id},
+        )
+        try:
+            result = json.loads(
+                process_module._handle_process(
+                    {"action": "kill", "session_id": owned.id},
+                    task_id="child-task",
+                )
+            )
+            assert result["status"] == "killed"
+        finally:
+            terminal_tool.set_capability_authorizer(None)
+            process_module.process_registry._running.pop(owned.id, None)
+
 
 # =========================================================================
 # format_process_notification + drain_notifications (shared helpers)

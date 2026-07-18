@@ -9,8 +9,13 @@ Run with:  python -m pytest tests/test_delegate.py -v
    or:     python tests/test_delegate.py
 """
 
+import copy
 import json
 import os
+from pathlib import Path
+import shlex
+import sys
+import tempfile
 import threading
 import time
 import types
@@ -37,6 +42,36 @@ from tools.delegate_tool import (
     _select_delegation_route,
     _inherit_parent_base_url,
 )
+from tools.delegation_capabilities import (
+    authorize_capability_command,
+    bind_capability_grant,
+    capability_child_timeout,
+    capability_max_iterations,
+    configured_capability_grant_names,
+    evaluate_capability_command,
+    select_capability_grant,
+)
+
+
+_CAPABILITY_TMP = tempfile.TemporaryDirectory()
+_CAPABILITY_ROOT = Path(_CAPABILITY_TMP.name) / "project"
+_CAPABILITY_CONTROLLER = _CAPABILITY_ROOT / "scripts" / "projectctl.py"
+_CAPABILITY_CONTROLLER.parent.mkdir(parents=True)
+_CAPABILITY_CONTROLLER.write_text("print('controller')\n", encoding="utf-8")
+_CAPABILITY_DEPENDENCY = _CAPABILITY_ROOT / "scripts" / "controller_support.py"
+_CAPABILITY_DEPENDENCY.write_text("VALUE = 'support'\n", encoding="utf-8")
+_CAPABILITY_PREFIX = [
+    sys.executable,
+    "-I",
+    "-S",
+    str(_CAPABILITY_CONTROLLER),
+    "repair",
+]
+_CAPABILITY_SERVICE = _CAPABILITY_ROOT / "bin" / "systemctl"
+_CAPABILITY_SERVICE.parent.mkdir(parents=True)
+_CAPABILITY_SERVICE.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+_CAPABILITY_SERVICE.chmod(0o755)
+_SERVICE_COMMAND = str(_CAPABILITY_SERVICE)
 
 
 def _make_mock_parent(depth=0):
@@ -56,6 +91,8 @@ def _make_mock_parent(depth=0):
     parent._delegate_depth = depth
     parent._active_children = []
     parent._active_children_lock = threading.Lock()
+    parent._delegate_mission_iteration_budget = None
+    parent._delegate_mission_deadline_monotonic = None
     parent._print_fn = None
     parent.tool_progress_callback = None
     parent.thinking_callback = None
@@ -79,6 +116,34 @@ def _make_route_class_config():
                 "provider": "xai-oauth",
                 "model": "grok-4.5",
                 "reasoning_effort": "high",
+            },
+        },
+        "max_iterations": 50,
+    }
+
+
+def _make_capability_grant_config():
+    return {
+        "default_capability_grant": "project-maintainer",
+        "capability_grants": {
+            "project-maintainer": {
+                "allowed_roots": [str(_CAPABILITY_ROOT)],
+                "allowed_services": ["ai.example.worker"],
+                "allowed_operations": ["controller", "service_reload"],
+                "service_commands": [_SERVICE_COMMAND],
+                "controller_commands": [
+                    {
+                        "argv": _CAPABILITY_PREFIX,
+                        "flag_options": ["--routine"],
+                        "value_options": ["--note"],
+                        "bound_files": [str(_CAPABILITY_DEPENDENCY)],
+                    }
+                ],
+                "max_iterations": 12,
+                "child_timeout_seconds": 120,
+            },
+            "observe-only": {
+                "allowed_operations": [],
             },
         },
         "max_iterations": 50,
@@ -1396,6 +1461,712 @@ class TestDelegationRouteClasses(unittest.TestCase):
         )
 
 
+class TestDelegationCapabilityGrants(unittest.TestCase):
+    """Opaque mission grants replace binary dangerous-command authority."""
+
+    def test_default_grant_is_normalized_and_content_addressed(self):
+        name, grant = select_capability_grant(_make_capability_grant_config())
+
+        self.assertEqual(name, "project-maintainer")
+        self.assertEqual(grant["allowed_roots"], [str(_CAPABILITY_ROOT.resolve())])
+        self.assertEqual(grant["max_iterations"], 12)
+        self.assertEqual(grant["child_timeout_seconds"], 120)
+        self.assertTrue(grant["grant_digest"].startswith("sha256:"))
+        self.assertEqual(
+            grant["controller_identities"][0]["identity_path"],
+            str(_CAPABILITY_CONTROLLER.resolve()),
+        )
+        self.assertEqual(len(grant["controller_identities"][0]["identity_sha256"]), 64)
+        self.assertIn(
+            "live_money_or_account_mutation",
+            grant["controller_contract_boundaries"],
+        )
+
+        bound = bind_capability_grant(grant, "repair the project")
+        repeated = bind_capability_grant(grant, "repair the project")
+        other = bind_capability_grant(grant, "different mission")
+        self.assertEqual(bound["mission_grant_id"], repeated["mission_grant_id"])
+        self.assertNotEqual(bound["mission_grant_id"], other["mission_grant_id"])
+
+    def test_unknown_or_malformed_grant_fails_closed(self):
+        with self.assertRaisesRegex(ValueError, "Unknown delegation capability_grant"):
+            select_capability_grant(_make_capability_grant_config(), "admin")
+
+        config = _make_capability_grant_config()
+        config["capability_grants"]["bad"] = {
+            "allowed_operations": ["everything"],
+        }
+        with self.assertRaisesRegex(ValueError, "unsupported operations"):
+            select_capability_grant(config, "bad")
+
+    def test_nested_worker_inherits_and_cannot_expand_grant(self):
+        _, parent_grant = select_capability_grant(_make_capability_grant_config())
+
+        inherited_name, inherited = select_capability_grant(
+            _make_capability_grant_config(),
+            inherited_name="project-maintainer",
+            inherited_grant=parent_grant,
+        )
+        self.assertEqual(inherited_name, "project-maintainer")
+        self.assertEqual(inherited, parent_grant)
+
+        with self.assertRaisesRegex(ValueError, "cannot expand capability_grant"):
+            select_capability_grant(
+                _make_capability_grant_config(),
+                "observe-only",
+                inherited_name="project-maintainer",
+                inherited_grant=parent_grant,
+            )
+
+        with self.assertRaisesRegex(ValueError, "parent mission has none"):
+            select_capability_grant(
+                _make_capability_grant_config(),
+                "project-maintainer",
+                inherit_from_parent=True,
+            )
+        self.assertEqual(
+            select_capability_grant(
+                _make_capability_grant_config(),
+                inherit_from_parent=True,
+            ),
+            (None, None),
+        )
+
+    def test_grant_budget_can_only_tighten_global_limits(self):
+        _, grant = select_capability_grant(_make_capability_grant_config())
+
+        self.assertEqual(capability_max_iterations(grant, 50), 12)
+        self.assertEqual(capability_max_iterations(grant, 8), 8)
+        self.assertEqual(capability_child_timeout(grant, None), 120)
+        self.assertEqual(capability_child_timeout(grant, 60), 60)
+
+    def test_turn_prologue_preserves_only_shared_mission_budget(self):
+        from agent.iteration_budget import IterationBudget
+        from agent.turn_context import _reset_iteration_budget_for_turn
+
+        shared = IterationBudget(12)
+        mission_agent = types.SimpleNamespace(
+            max_iterations=12,
+            iteration_budget=shared,
+            _preserve_iteration_budget_across_turns=True,
+        )
+        _reset_iteration_budget_for_turn(mission_agent)
+        self.assertIs(mission_agent.iteration_budget, shared)
+
+        ordinary = types.SimpleNamespace(
+            max_iterations=7,
+            iteration_budget=shared,
+            _preserve_iteration_budget_across_turns=False,
+        )
+        _reset_iteration_budget_for_turn(ordinary)
+        self.assertIsNot(ordinary.iteration_budget, shared)
+        self.assertEqual(ordinary.iteration_budget.max_total, 7)
+
+    @patch("run_agent.AIAgent")
+    @patch("tools.delegate_tool._load_config", return_value={})
+    def test_nested_descendant_inherits_mission_budget_and_deadline(
+        self, _mock_cfg, MockAgent
+    ):
+        from agent.iteration_budget import IterationBudget
+
+        _, grant = select_capability_grant(_make_capability_grant_config())
+        shared_budget = IterationBudget(12)
+        deadline = time.monotonic() + 90
+        parent = _make_mock_parent(depth=1)
+        parent.enabled_toolsets = ["terminal", "delegation"]
+        parent._delegate_mission_iteration_budget = shared_budget
+        parent._delegate_mission_deadline_monotonic = deadline
+        child = MagicMock()
+        MockAgent.return_value = child
+
+        built = _build_child_agent(
+            task_index=0,
+            goal="nested repair",
+            context=None,
+            toolsets=None,
+            model="grok-composer-2.5-fast",
+            max_iterations=12,
+            task_count=1,
+            parent_agent=parent,
+            capability_grant=grant,
+        )
+
+        self.assertIs(MockAgent.call_args.kwargs["iteration_budget"], shared_budget)
+        self.assertIs(built._delegate_mission_iteration_budget, shared_budget)
+        self.assertEqual(built._delegate_mission_deadline_monotonic, deadline)
+
+    def test_controller_and_service_reload_are_exactly_scoped(self):
+        _, grant = select_capability_grant(_make_capability_grant_config())
+        grant = bind_capability_grant(grant, "maintain project")
+
+        self.assertEqual(
+            authorize_capability_command(
+                shlex.join([*_CAPABILITY_PREFIX, "--routine"]),
+                grant,
+                effective_cwd=str(_CAPABILITY_ROOT),
+            ),
+            (True, "controller"),
+        )
+        self.assertEqual(
+            authorize_capability_command(
+                f"{_SERVICE_COMMAND} restart ai.example.worker",
+                grant,
+                effective_cwd=str(_CAPABILITY_ROOT),
+            ),
+            (True, "service_reload"),
+        )
+        self.assertFalse(
+            authorize_capability_command(
+                f"{_SERVICE_COMMAND} restart ai.other.worker",
+                grant,
+                effective_cwd=str(_CAPABILITY_ROOT),
+            )[0]
+        )
+        self.assertEqual(
+            authorize_capability_command(
+                shlex.join(
+                    [*_CAPABILITY_PREFIX, "--note", "paper (routine); no action"]
+                ),
+                grant,
+                effective_cwd=str(_CAPABILITY_ROOT),
+            ),
+            (True, "controller"),
+        )
+        self.assertFalse(
+            authorize_capability_command(
+                shlex.join([sys.executable, str(_CAPABILITY_CONTROLLER), "status"]),
+                grant,
+                effective_cwd=str(_CAPABILITY_ROOT),
+            )[0]
+        )
+        self.assertFalse(
+            authorize_capability_command(
+                shlex.join([*_CAPABILITY_PREFIX, "--live", "submit-order"]),
+                grant,
+                effective_cwd=str(_CAPABILITY_ROOT),
+            )[0]
+        )
+        self.assertFalse(
+            authorize_capability_command(
+                shlex.join(_CAPABILITY_PREFIX) + " 2>/tmp/controller.log",
+                grant,
+                effective_cwd=str(_CAPABILITY_ROOT),
+            )[0]
+        )
+
+    def test_removed_generic_mutation_operations_fail_closed(self):
+        config = _make_capability_grant_config()
+        config["capability_grants"]["bad"] = {
+            "allowed_roots": [str(_CAPABILITY_ROOT)],
+            "allowed_operations": ["remove_within_roots"],
+        }
+        with self.assertRaisesRegex(ValueError, "unsupported operations"):
+            select_capability_grant(config, "bad")
+
+    def test_adversarial_shell_service_and_boundary_matrix_is_denied(self):
+        _, grant = select_capability_grant(_make_capability_grant_config())
+        grant = bind_capability_grant(grant, "maintain project")
+        for command in (
+            "/tmp/evil/systemctl restart ai.example.worker",
+            "systemctl restart ai.example.worker",
+            f"env {_SERVICE_COMMAND} restart ai.example.worker",
+            "systemctl restart --host=attacker ai.example.worker",
+            "docker restart --context=remote ai.example.worker",
+            shlex.join([*_CAPABILITY_PREFIX, "--mode", "live"]),
+            shlex.join([*_CAPABILITY_PREFIX, "send-message", "public"]),
+            shlex.join([*_CAPABILITY_PREFIX, "token.json"]),
+            shlex.join(_CAPABILITY_PREFIX) + " && curl https://example.com",
+        ):
+            with self.subTest(command=command):
+                self.assertFalse(
+                    authorize_capability_command(
+                        command,
+                        grant,
+                        effective_cwd=str(_CAPABILITY_ROOT),
+                    )[0]
+                )
+
+    def test_lifecycle_wrappers_are_capability_sensitive_and_denied(self):
+        _, grant = select_capability_grant(_make_capability_grant_config())
+        grant = bind_capability_grant(grant, "maintain project")
+        for command in (
+            f"({_SERVICE_COMMAND} restart ai.example.worker)",
+            f"eval '{_SERVICE_COMMAND} restart ai.example.worker'",
+            f"true && nice {_SERVICE_COMMAND} restart ai.example.worker",
+            f"/usr/bin/env {_SERVICE_COMMAND} restart ai.example.worker",
+            f"{_CAPABILITY_SERVICE.parent}/systemct[l] restart ai.example.worker",
+            "/bin/[l]aunchctl kickstart -k gui/501/ai.example.worker",
+            "/bin/launch[c]tl kickstart -k gui/501/ai.example.worker",
+            "/bin/syste[m]ctl restart ai.example.worker",
+            "/usr/bin/do[c]ker restart ai.example.worker",
+            "/bin/launchct? kickstart -k gui/501/ai.example.worker",
+            "/bin/lau*ctl kickstart -k gui/501/ai.example.worker",
+            "/bin/systemct? restart ai.example.worker",
+            "/usr/bin/docke? restart ai.example.worker",
+        ):
+            with self.subTest(command=command):
+                decision = evaluate_capability_command(
+                    command,
+                    grant,
+                    effective_cwd=str(_CAPABILITY_ROOT),
+                    env_type="local",
+                )
+                self.assertTrue(decision["matched"])
+                self.assertFalse(decision["allowed"])
+
+    def test_service_symlink_alias_is_sensitive_but_not_granted(self):
+        _, grant = select_capability_grant(_make_capability_grant_config())
+        grant = bind_capability_grant(grant, "maintain project")
+        alias = _CAPABILITY_ROOT / "svc"
+        alias.unlink(missing_ok=True)
+        alias.symlink_to(_SERVICE_COMMAND)
+        try:
+            for command in (
+                f"{alias} restart ai.example.worker",
+                "./svc restart ai.example.worker",
+            ):
+                with self.subTest(command=command):
+                    decision = evaluate_capability_command(
+                        command,
+                        grant,
+                        effective_cwd=str(_CAPABILITY_ROOT),
+                        env_type="local",
+                    )
+                    self.assertTrue(decision["matched"])
+                    self.assertFalse(decision["allowed"])
+                    self.assertEqual(
+                        decision["reason"], "service_executable_not_granted"
+                    )
+        finally:
+            alias.unlink(missing_ok=True)
+
+    def test_read_only_service_and_shared_interpreter_commands_are_unmatched(self):
+        _, grant = select_capability_grant(_make_capability_grant_config())
+        grant = bind_capability_grant(grant, "maintain project")
+        other_script = _CAPABILITY_ROOT / "scripts" / "other.py"
+        other_script.write_text("print('other')\n", encoding="utf-8")
+        for command in (
+            f"{_SERVICE_COMMAND} status ai.example.worker",
+            shlex.join([sys.executable, str(other_script)]),
+            shlex.join([sys.executable, "-m", "pytest", "--version"]),
+            shlex.join([sys.executable, "--version"]),
+        ):
+            with self.subTest(command=command):
+                decision = evaluate_capability_command(
+                    command,
+                    grant,
+                    effective_cwd=str(_CAPABILITY_ROOT),
+                    env_type="local",
+                )
+        self.assertFalse(decision["matched"])
+
+    @unittest.skipUnless(
+        hasattr(os, "getuid") and Path("/bin/launchctl").is_file(),
+        "launchctl is macOS-only",
+    )
+    def test_launchctl_exact_local_kickstart_grammar(self):
+        config = {
+            "capability_grants": {
+                "mac-service": {
+                    "allowed_roots": [str(_CAPABILITY_ROOT)],
+                    "allowed_services": ["ai.example.worker"],
+                    "allowed_operations": ["service_reload"],
+                    "service_commands": ["/bin/launchctl"],
+                }
+            }
+        }
+        _, grant = select_capability_grant(config, "mac-service")
+        command = (
+            f"/bin/launchctl kickstart -k "
+            f"gui/{os.getuid()}/ai.example.worker"
+        )
+        self.assertEqual(
+            authorize_capability_command(
+                command,
+                grant,
+                effective_cwd=str(_CAPABILITY_ROOT),
+                env_type="local",
+            ),
+            (True, "service_reload"),
+        )
+
+    def test_interactive_shell_or_repl_is_denied_for_scoped_mission(self):
+        _, grant = select_capability_grant(_make_capability_grant_config())
+        grant = bind_capability_grant(grant, "maintain project")
+        for command in ("bash", "/bin/zsh -l", sys.executable):
+            with self.subTest(command=command):
+                decision = evaluate_capability_command(
+                    command,
+                    grant,
+                    effective_cwd=str(_CAPABILITY_ROOT),
+                    env_type="local",
+                )
+                self.assertTrue(decision["matched"])
+                self.assertFalse(decision["allowed"])
+                self.assertEqual(
+                    decision["reason"], "interactive_process_stdin_not_granted"
+                )
+
+    def test_controller_cwd_and_content_are_bound(self):
+        _, grant = select_capability_grant(_make_capability_grant_config())
+        grant = bind_capability_grant(grant, "maintain project")
+        command = shlex.join([*_CAPABILITY_PREFIX, "--routine"])
+        self.assertFalse(
+            authorize_capability_command(
+                command,
+                grant,
+                effective_cwd=str(_CAPABILITY_ROOT.parent / "other"),
+            )[0]
+        )
+        original = _CAPABILITY_CONTROLLER.read_text(encoding="utf-8")
+        try:
+            _CAPABILITY_CONTROLLER.write_text("print('tampered')\n", encoding="utf-8")
+            self.assertEqual(
+                authorize_capability_command(
+                    command,
+                    grant,
+                    effective_cwd=str(_CAPABILITY_ROOT),
+                ),
+                (False, "controller_content_changed"),
+            )
+        finally:
+            _CAPABILITY_CONTROLLER.write_text(original, encoding="utf-8")
+
+    def test_controller_dependency_content_is_bound(self):
+        _, grant = select_capability_grant(_make_capability_grant_config())
+        grant = bind_capability_grant(grant, "maintain project")
+        command = shlex.join([*_CAPABILITY_PREFIX, "--routine"])
+        original = _CAPABILITY_DEPENDENCY.read_text(encoding="utf-8")
+        try:
+            _CAPABILITY_DEPENDENCY.write_text("VALUE = 'changed'\n", encoding="utf-8")
+            self.assertEqual(
+                authorize_capability_command(
+                    command,
+                    grant,
+                    effective_cwd=str(_CAPABILITY_ROOT),
+                ),
+                (False, "controller_dependency_changed"),
+            )
+        finally:
+            _CAPABILITY_DEPENDENCY.write_text(original, encoding="utf-8")
+
+    def test_isolated_python_controller_prefix_is_supported(self):
+        config = {
+            "capability_grants": {
+                "isolated": {
+                    "allowed_roots": [str(_CAPABILITY_ROOT)],
+                    "allowed_operations": ["controller"],
+                    "controller_commands": [
+                        {
+                            "argv": [
+                                sys.executable,
+                                "-I",
+                                "-S",
+                                str(_CAPABILITY_CONTROLLER),
+                                "repair",
+                            ],
+                            "bound_files": [str(_CAPABILITY_DEPENDENCY)],
+                        }
+                    ],
+                }
+            }
+        }
+        _, grant = select_capability_grant(config, "isolated")
+        command = shlex.join(
+            [sys.executable, "-I", "-S", str(_CAPABILITY_CONTROLLER), "repair"]
+        )
+        self.assertEqual(
+            authorize_capability_command(
+                command,
+                grant,
+                effective_cwd=str(_CAPABILITY_ROOT),
+            ),
+            (True, "controller"),
+        )
+
+        for bad_flags in ([], ["-I"], ["-S"], ["-S", "-I"], ["-I", "-S", "-c"]):
+            bad = copy.deepcopy(config)
+            bad["capability_grants"]["isolated"]["controller_commands"][0][
+                "argv"
+            ] = [
+                sys.executable,
+                *bad_flags,
+                str(_CAPABILITY_CONTROLLER),
+                "repair",
+            ]
+            with self.subTest(flags=bad_flags), self.assertRaisesRegex(
+                ValueError, "exact -I -S isolation flags"
+            ):
+                select_capability_grant(bad, "isolated")
+
+        for interpreter_name in ("ruby", "perl", "node", "python2", "python3.3"):
+            interpreter = _CAPABILITY_ROOT / "bin" / interpreter_name
+            interpreter.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            interpreter.chmod(0o755)
+            bad = copy.deepcopy(config)
+            bad["capability_grants"]["isolated"]["controller_commands"][0][
+                "argv"
+            ][0] = str(interpreter)
+            with self.subTest(interpreter=interpreter_name), self.assertRaisesRegex(
+                ValueError, "interpreted controllers must use Python|exact -I -S isolation"
+            ):
+                select_capability_grant(bad, "isolated")
+
+    def test_duplicate_controller_prefix_cannot_split_dependency_contract(self):
+        config = _make_capability_grant_config()
+        first = config["capability_grants"]["project-maintainer"][
+            "controller_commands"
+        ][0]
+        duplicate = copy.deepcopy(first)
+        duplicate["bound_files"] = [str(_CAPABILITY_CONTROLLER)]
+        config["capability_grants"]["project-maintainer"][
+            "controller_commands"
+        ].append(duplicate)
+
+        with self.assertRaisesRegex(ValueError, "argv prefixes must be unique"):
+            select_capability_grant(config, "project-maintainer")
+
+    def test_relative_controller_symlink_alias_is_sensitive_but_denied(self):
+        _, grant = select_capability_grant(_make_capability_grant_config())
+        grant = bind_capability_grant(grant, "maintain project")
+        alias = _CAPABILITY_ROOT / "scripts" / "projectctl-alias.py"
+        alias.unlink(missing_ok=True)
+        alias.symlink_to(_CAPABILITY_CONTROLLER.name)
+        try:
+            decision = evaluate_capability_command(
+                shlex.join(
+                    [sys.executable, "./scripts/projectctl-alias.py", "repair"]
+                ),
+                grant,
+                effective_cwd=str(_CAPABILITY_ROOT),
+                env_type="local",
+            )
+            self.assertTrue(decision["matched"])
+            self.assertFalse(decision["allowed"])
+            self.assertEqual(decision["reason"], "controller_argv_not_granted")
+        finally:
+            alias.unlink(missing_ok=True)
+
+    def test_controller_glob_spellings_are_sensitive_but_denied(self):
+        _, grant = select_capability_grant(_make_capability_grant_config())
+        grant = bind_capability_grant(grant, "maintain project")
+        controller = str(_CAPABILITY_CONTROLLER)
+        patterns = (
+            controller.replace("projectctl.py", "projectct[l].py"),
+            controller.replace("projectctl.py", "projectct?.py"),
+            controller.replace("projectctl.py", "pro*ctl.py"),
+        )
+        for pattern in patterns:
+            command = f"{sys.executable} {pattern} repair"
+            with self.subTest(command=command):
+                decision = evaluate_capability_command(
+                    command,
+                    grant,
+                    effective_cwd=str(_CAPABILITY_ROOT),
+                    env_type="local",
+                )
+                self.assertTrue(decision["matched"])
+                self.assertFalse(decision["allowed"])
+                self.assertEqual(decision["reason"], "capability_requires_plain_argv")
+
+    def test_controller_symlink_retarget_is_denied(self):
+        target_a = _CAPABILITY_ROOT / "scripts" / "controller-a.py"
+        target_b = _CAPABILITY_ROOT / "scripts" / "controller-b.py"
+        link = _CAPABILITY_ROOT / "scripts" / "controller-link.py"
+        target_a.write_text("print('a')\n", encoding="utf-8")
+        target_b.write_text("print('b')\n", encoding="utf-8")
+        link.unlink(missing_ok=True)
+        link.symlink_to(target_a.name)
+        config = {
+            "capability_grants": {
+                "symlink-controller": {
+                    "allowed_roots": [str(_CAPABILITY_ROOT)],
+                    "allowed_operations": ["controller"],
+                    "controller_commands": [
+                        {
+                            "argv": [
+                                sys.executable,
+                                "-I",
+                                "-S",
+                                str(link),
+                                "repair",
+                            ]
+                        }
+                    ],
+                }
+            }
+        }
+        _, grant = select_capability_grant(config, "symlink-controller")
+        command = shlex.join(
+            [sys.executable, "-I", "-S", str(link), "repair"]
+        )
+        self.assertTrue(
+            authorize_capability_command(
+                command,
+                grant,
+                effective_cwd=str(_CAPABILITY_ROOT),
+            )[0]
+        )
+        link.unlink()
+        link.symlink_to(target_b.name)
+        try:
+            self.assertEqual(
+                authorize_capability_command(
+                    command,
+                    grant,
+                    effective_cwd=str(_CAPABILITY_ROOT),
+                ),
+                (False, "controller_identity_changed"),
+            )
+        finally:
+            link.unlink(missing_ok=True)
+
+    @patch("tools.delegate_tool._load_config")
+    def test_dynamic_schema_exposes_only_configured_grants(self, mock_cfg):
+        from tools.delegate_tool import _build_dynamic_schema_overrides
+
+        mock_cfg.return_value = _make_capability_grant_config()
+        properties = _build_dynamic_schema_overrides()["parameters"]["properties"]
+        expected = ["observe-only", "project-maintainer"]
+
+        self.assertEqual(properties["capability_grant"]["enum"], expected)
+        self.assertEqual(
+            properties["tasks"]["items"]["properties"]["capability_grant"]["enum"],
+            expected,
+        )
+        self.assertEqual(
+            configured_capability_grant_names(mock_cfg.return_value),
+            expected,
+        )
+
+    @patch("tools.delegate_tool._load_config", return_value={})
+    def test_dynamic_schema_hides_grant_for_legacy_config(self, _mock_cfg):
+        from tools.delegate_tool import _build_dynamic_schema_overrides
+
+        properties = _build_dynamic_schema_overrides()["parameters"]["properties"]
+        self.assertNotIn("capability_grant", properties)
+        self.assertNotIn(
+            "capability_grant",
+            properties["tasks"]["items"]["properties"],
+        )
+
+    @patch("run_agent.AIAgent")
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    @patch("tools.delegate_tool._load_config")
+    def test_default_grant_reaches_child_prompt_budget_and_result(
+        self,
+        mock_cfg,
+        mock_resolve,
+        MockAgent,
+    ):
+        mock_cfg.return_value = _make_capability_grant_config()
+        mock_resolve.return_value = {
+            "model": "grok-composer-2.5-fast",
+            "provider": "xai-oauth",
+            "base_url": "https://api.x.ai/v1",
+            "api_key": "oauth-token",
+            "api_mode": "codex_responses",
+            "request_overrides": {},
+            "max_output_tokens": None,
+            "command": None,
+            "args": [],
+        }
+        child = MagicMock()
+        child.model = "grok-composer-2.5-fast"
+        child.session_prompt_tokens = 1
+        child.session_completion_tokens = 1
+        child.run_conversation.return_value = {
+            "final_response": "done",
+            "completed": True,
+            "api_calls": 1,
+        }
+        MockAgent.return_value = child
+
+        result = json.loads(
+            delegate_task(goal="routine repair", parent_agent=_make_mock_parent())
+        )
+
+        self.assertEqual(MockAgent.call_args.kwargs["max_iterations"], 12)
+        mission_budget = MockAgent.call_args.kwargs["iteration_budget"]
+        self.assertEqual(mission_budget.max_total, 12)
+        self.assertIs(child._delegate_mission_iteration_budget, mission_budget)
+        self.assertIsInstance(child._delegate_mission_deadline_monotonic, float)
+        prompt = MockAgent.call_args.kwargs["ephemeral_system_prompt"]
+        self.assertIn("MISSION CAPABILITY GRANT", prompt)
+        self.assertIn("project-maintainer", prompt)
+        self.assertIn(str(_CAPABILITY_DEPENDENCY), prompt)
+        self.assertEqual(
+            result["results"][0]["capability_grant"],
+            "project-maintainer",
+        )
+        self.assertTrue(
+            result["results"][0]["capability_grant_id"].startswith("cap-")
+        )
+
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    @patch("tools.delegate_tool._load_config")
+    def test_delegate_rejects_unknown_grant_before_credentials(
+        self,
+        mock_cfg,
+        mock_resolve,
+    ):
+        mock_cfg.return_value = _make_capability_grant_config()
+
+        result = json.loads(
+            delegate_task(
+                goal="Do work",
+                capability_grant="admin",
+                parent_agent=_make_mock_parent(),
+            )
+        )
+
+        self.assertIn("error", result)
+        self.assertIn("Unknown delegation capability_grant", result["error"])
+        mock_resolve.assert_not_called()
+
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    @patch("tools.delegate_tool._load_config")
+    def test_scoped_grant_rejects_out_of_process_tool_transports(
+        self,
+        mock_cfg,
+        mock_resolve,
+    ):
+        mock_cfg.return_value = _make_capability_grant_config()
+        parent = _make_mock_parent()
+        cases = (
+            {
+                "model": "copilot-model",
+                "provider": "copilot-acp",
+                "base_url": "acp://copilot",
+                "api_key": "acp",
+                "api_mode": "chat_completions",
+                "command": "copilot",
+                "args": [],
+            },
+            {
+                "model": "gpt-codex",
+                "provider": "openai-codex",
+                "base_url": None,
+                "api_key": "oauth",
+                "api_mode": "codex_app_server",
+                "command": None,
+                "args": [],
+            },
+        )
+        for credentials in cases:
+            with self.subTest(credentials=credentials):
+                mock_resolve.return_value = credentials
+                result = json.loads(
+                    delegate_task(
+                        goal="scoped maintenance",
+                        capability_grant="project-maintainer",
+                        parent_agent=parent,
+                    )
+                )
+                self.assertIn("error", result)
+                self.assertIn("outside the Hermes mission guard", result["error"])
+
+
 class TestDelegationCredentialResolution(unittest.TestCase):
     """Tests for provider:model credential resolution in delegation config."""
 
@@ -1686,6 +2457,32 @@ class TestDelegationCredentialResolution(unittest.TestCase):
         self.assertEqual(creds["api_mode"], "bedrock_converse")
         mock_resolve.assert_called_once()
         self.assertEqual(mock_resolve.call_args.kwargs.get("requested"), "bedrock")
+
+    @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
+    def test_named_xai_provider_with_base_url_resolves_real_credentials(self, mock_resolve):
+        """Regression: Team A sets delegation.provider=xai with base_url=api.x.ai
+        but no api_key. That must resolve XAI_API_KEY via runtime_provider, not
+        demote to provider=custom and inherit a Codex/parent key (xAI 400
+        Incorrect API key)."""
+        mock_resolve.return_value = {
+            "provider": "xai",
+            "base_url": "https://api.x.ai/v1",
+            "api_key": "xai-resolved-from-env",
+            "api_mode": "chat_completions",
+        }
+        parent = _make_mock_parent(depth=0)
+        cfg = {
+            "model": "grok-4.5",
+            "provider": "xai",
+            "base_url": "https://api.x.ai/v1",
+        }
+        creds = _resolve_delegation_credentials(cfg, parent)
+        self.assertEqual(creds["provider"], "xai")
+        self.assertEqual(creds["api_key"], "xai-resolved-from-env")
+        self.assertEqual(creds["base_url"], "https://api.x.ai/v1")
+        mock_resolve.assert_called_once_with(
+            requested="xai", target_model="grok-4.5"
+        )
 
 
 
@@ -2501,10 +3298,13 @@ class TestDelegateHeartbeat(unittest.TestCase):
         }
 
         def slow_run(**kwargs):
-            # Long enough to exceed the OLD idle threshold (5 cycles) at
-            # the patched interval, but shorter than the new in-tool
-            # threshold.
-            time.sleep(0.4)
+            # Wait until the heartbeat has demonstrated the behavior under
+            # test instead of assuming a busy CI runner will schedule three
+            # heartbeat cycles within a fixed 0.4-second window. With the old
+            # idle-threshold bug this remains capped at two and times out.
+            deadline = time.monotonic() + 2.0
+            while len(touch_calls) <= 2 and time.monotonic() < deadline:
+                time.sleep(0.01)
             return {"final_response": "done", "completed": True, "api_calls": 1}
 
         child.run_conversation.side_effect = slow_run
@@ -2529,7 +3329,7 @@ class TestDelegateHeartbeat(unittest.TestCase):
         self.assertGreater(
             len(touch_calls), 2,
             f"Heartbeat stopped too early while child was inside a tool; "
-            f"got {len(touch_calls)} touches over 0.4s at 0.05s interval",
+            f"got {len(touch_calls)} touches at 0.05s interval",
         )
 
 
@@ -2678,6 +3478,7 @@ class TestDispatchDelegateTask(unittest.TestCase):
                 {
                     "goal": "test",
                     "route_class": "fast",
+                    "capability_grant": "project-maintainer",
                     "acp_command": "claude",
                     "acp_args": ["--acp", "--stdio"],
                     "tasks": [
@@ -2695,6 +3496,7 @@ class TestDispatchDelegateTask(unittest.TestCase):
         self.assertNotIn("acp_args", captured)
         self.assertEqual(captured["goal"], "test")
         self.assertEqual(captured["route_class"], "fast")
+        self.assertEqual(captured["capability_grant"], "project-maintainer")
         self.assertNotIn("acp_command", captured["tasks"][0])
         self.assertNotIn("acp_args", captured["tasks"][0])
         self.assertEqual(captured["tasks"][0]["route_class"], "strong")
@@ -3451,36 +4253,82 @@ class TestSubagentApprovalCallback(unittest.TestCase):
         )
         self.assertIs(_get_subagent_approval_callback(), _subagent_auto_approve)
 
-    def test_executor_initializer_installs_callback_in_worker(self):
-        """The initializer sets the callback on the worker thread's TLS,
-        not the parent's — verifies the fix actually scopes to workers.
-        """
+    @patch(
+        "tools.delegate_tool._load_config",
+        return_value={"subagent_auto_approve": True},
+    )
+    def test_scoped_grant_takes_precedence_over_legacy_auto_approve(self, _mock_cfg):
+        from tools.delegate_tool import (
+            _get_subagent_approval_callback,
+            _make_subagent_capability_authorizer,
+            _subagent_auto_deny,
+        )
+
+        _, grant = select_capability_grant(_make_capability_grant_config())
+        grant = bind_capability_grant(grant, "maintain project")
+        callback = _get_subagent_approval_callback(
+            grant,
+            workspace_path=str(_CAPABILITY_ROOT),
+        )
+        authorizer = _make_subagent_capability_authorizer(grant)
+
+        self.assertIs(callback, _subagent_auto_deny)
+        decision = authorizer(
+            f"{_SERVICE_COMMAND} restart ai.example.worker",
+            effective_cwd=str(_CAPABILITY_ROOT),
+            env_type="local",
+        )
+        self.assertTrue(decision["matched"])
+        self.assertTrue(decision["allowed"])
+        self.assertEqual(
+            callback("rm -rf /workspace/other", "recursive deletion"),
+            "deny",
+        )
+
+    def test_ungranted_subagent_does_not_install_typed_authorizer(self):
+        from tools.delegate_tool import _make_subagent_capability_authorizer
+
+        self.assertIsNone(_make_subagent_capability_authorizer(None))
+
+    def test_executor_initializer_installs_both_worker_policies(self):
+        """Approval and capability policies are worker-thread local."""
         from concurrent.futures import ThreadPoolExecutor
         from tools.terminal_tool import (
             set_approval_callback as _set_cb,
             _get_approval_callback,
+            set_capability_authorizer as _set_capability,
+            _get_capability_authorizer,
         )
-        from tools.delegate_tool import _subagent_auto_deny
+        from tools.delegate_tool import (
+            _install_subagent_terminal_policy,
+            _subagent_auto_deny,
+        )
 
-        # Parent thread has no callback.
+        capability = lambda *args, **kwargs: {  # noqa: E731
+            "matched": False,
+            "allowed": False,
+            "reason": "test",
+        }
         _set_cb(None)
+        _set_capability(None)
         self.assertIsNone(_get_approval_callback())
+        self.assertIsNone(_get_capability_authorizer())
 
         seen = []
 
         def worker():
-            seen.append(_get_approval_callback())
+            seen.append((_get_approval_callback(), _get_capability_authorizer()))
 
         with ThreadPoolExecutor(
             max_workers=1,
-            initializer=_set_cb,
-            initargs=(_subagent_auto_deny,),
+            initializer=_install_subagent_terminal_policy,
+            initargs=(_subagent_auto_deny, capability),
         ) as executor:
             executor.submit(worker).result()
 
-        self.assertEqual(seen, [_subagent_auto_deny])
-        # Parent's callback slot is still empty (TLS isolates threads).
+        self.assertEqual(seen, [(_subagent_auto_deny, capability)])
         self.assertIsNone(_get_approval_callback())
+        self.assertIsNone(_get_capability_authorizer())
 
 
 class TestFallbackModelInheritance(unittest.TestCase):

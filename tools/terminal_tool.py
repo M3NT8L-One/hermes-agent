@@ -181,6 +181,11 @@ def _get_approval_callback():
     return getattr(_callback_tls, "approval", None)
 
 
+def _get_capability_authorizer():
+    """Return the typed delegated-mission authorizer for this worker thread."""
+    return getattr(_callback_tls, "capability_authorizer", None)
+
+
 def set_sudo_password_callback(cb):
     """Register a callback for sudo password prompts (used by CLI).
 
@@ -198,6 +203,16 @@ def set_approval_callback(cb):
     GHSA-qg5c-hvr5-hjgr.
     """
     _callback_tls.approval = cb
+
+
+def set_capability_authorizer(cb):
+    """Install a typed delegated-mission authorizer in the current thread.
+
+    Unlike the legacy approval callback, this hook is evaluated by the
+    consolidated guard for every terminal context, including non-interactive,
+    gateway, cron, and async worker paths.
+    """
+    _callback_tls.capability_authorizer = cb
 
 
 def _get_sudo_password_cache_scope() -> str:
@@ -279,10 +294,13 @@ def _docker_has_host_access(config: Dict[str, Any]) -> bool:
 
 
 def _check_all_guards(command: str, env_type: str,
-                      has_host_access: bool = False) -> dict:
+                      has_host_access: bool = False,
+                      effective_cwd: Optional[str] = None) -> dict:
     """Delegate to consolidated guard (tirith + dangerous cmd) with CLI callback."""
     return _check_all_guards_impl(command, env_type,
                                   approval_callback=_get_approval_callback(),
+                                  capability_callback=_get_capability_authorizer(),
+                                  effective_cwd=effective_cwd,
                                   has_host_access=has_host_access)
 
 
@@ -2371,18 +2389,47 @@ def terminal_tool(
                     "status": "error",
                 }, ensure_ascii=False)
 
-        # Pre-exec security checks (tirith + dangerous command detection)
-        # Skip check if force=True (user has confirmed they want to run it)
+        # Resolve and validate the exact cwd before authorization. Capability
+        # decisions must describe where the command will actually execute,
+        # including an explicit workdir or the terminal's retained `cd` state.
+        if workdir:
+            workdir_error = _validate_workdir(workdir)
+            if workdir_error:
+                logger.warning("Blocked dangerous workdir: %s (command: %s)",
+                               workdir[:200], _safe_command_preview(command))
+                return json.dumps({
+                    "output": "",
+                    "exit_code": -1,
+                    "error": workdir_error,
+                    "status": "blocked"
+                }, ensure_ascii=False)
+
+        # Resolve the exact per-session cwd once so capability authorization,
+        # background spawn, and foreground execution all use the same path.
+        from tools.approval import get_current_session_key
+
+        session_key = get_current_session_key(default="") or (task_id or "")
+        effective_cwd = _resolve_command_cwd(
+            workdir=workdir,
+            default_cwd=cwd,
+            session_key=session_key,
+        )
+
+        # Pre-exec security checks (tirith + dangerous command detection).
+        # ``force`` skips ordinary approval only. A scoped delegated mission
+        # remains authoritative because the internal replay flag must not
+        # broaden a child grant.
         approval_note = None
         # True when the user explicitly approved this run (or pre-confirmed via
         # force).  Drives the clean-interrupt-slate clear before env.execute so
         # an approved command can't be SIGINT-killed by a bit that landed during
         # the approval-wait (see clear_current_thread_interrupt).
         _approved_run = bool(force)
-        if not force:
+        if not force or _get_capability_authorizer() is not None:
             approval = _check_all_guards(
                 command, env_type,
                 has_host_access=_docker_has_host_access(config),
+                effective_cwd=effective_cwd,
             )
             if not approval["approved"]:
                 # Check if this is an approval_required (gateway ask mode)
@@ -2420,19 +2467,6 @@ def terminal_tool(
                 desc = approval.get("description", "flagged as dangerous")
                 approval_note = f"Command was flagged ({desc}) and auto-approved by smart approval."
 
-        # Validate workdir against shell injection
-        if workdir:
-            workdir_error = _validate_workdir(workdir)
-            if workdir_error:
-                logger.warning("Blocked dangerous workdir: %s (command: %s)",
-                               workdir[:200], _safe_command_preview(command))
-                return json.dumps({
-                    "output": "",
-                    "exit_code": -1,
-                    "error": workdir_error,
-                    "status": "blocked"
-                }, ensure_ascii=False)
-
         # Prepare command for execution
         pty_disabled_reason = None
         effective_pty = pty
@@ -2445,13 +2479,6 @@ def terminal_tool(
                 "EOF."
             )
 
-        # The session key that drives cwd records: get_current_session_key()'s
-        # contextvar doesn't cross tool-worker threads, so fall back to the raw
-        # task_id (which IS the session_key for the top-level agent) — a
-        # stable, thread-safe anchor.
-        from tools.approval import get_current_session_key
-
-        session_key = get_current_session_key(default="") or (task_id or "")
 
         if background:
             # Spawn a tracked background process via the process registry.
@@ -2459,11 +2486,7 @@ def terminal_tool(
             # For non-local backends: runs inside the sandbox via env.execute().
             from tools.process_registry import process_registry
 
-            effective_cwd = _resolve_command_cwd(
-                workdir=workdir,
-                default_cwd=cwd,
-                session_key=session_key,
-            )
+
             try:
                 if env_type == "local":
                     proc_session = process_registry.spawn_local(
@@ -2719,11 +2742,7 @@ def terminal_tool(
 
             while retry_count <= max_retries:
                 try:
-                    command_cwd = _resolve_command_cwd(
-                        workdir=workdir,
-                        default_cwd=cwd,
-                        session_key=session_key,
-                    )
+                    command_cwd = effective_cwd
                     execute_kwargs = {
                         "timeout": effective_timeout,
                         "cwd": command_cwd,

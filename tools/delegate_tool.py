@@ -39,7 +39,19 @@ from toolsets import TOOLSETS
 # Must match hermes_cli.runtime_provider.RUNTIME_PROVIDER_TYPE_CUSTOM.
 _RUNTIME_PROVIDER_CUSTOM = "custom"
 from tools import file_state
-from tools.terminal_tool import set_approval_callback as _set_subagent_approval_cb
+from tools.delegation_capabilities import (
+    bind_capability_grant,
+    capability_child_timeout,
+    capability_max_iterations,
+    capability_prompt_block,
+    configured_capability_grant_names,
+    evaluate_capability_command,
+    select_capability_grant,
+)
+from tools.terminal_tool import (
+    set_approval_callback as _set_subagent_approval_cb,
+    set_capability_authorizer as _set_subagent_capability_authorizer,
+)
 from utils import base_url_hostname, is_truthy_value
 
 
@@ -64,11 +76,12 @@ DELEGATE_BLOCKED_TOOLS = frozenset(
 # prompt_dangerous_approval() falls back to input() from the worker thread,
 # which deadlocks against the parent's prompt_toolkit TUI that owns stdin.
 #
-# Fix: install a non-interactive callback into every subagent worker thread
-# via ThreadPoolExecutor(initializer=_set_subagent_approval_cb, initargs=(cb,)).
-# The callback is chosen by the `delegation.subagent_auto_approve` config:
+# Fix: install a non-interactive approval callback and a typed capability
+# authorizer into every subagent worker thread. The typed authorizer is called
+# by the terminal guard in CLI, gateway, cron, async, and non-interactive paths.
+# Legacy configs fall back to subagent_auto_approve for other dangerous cmds:
 #   false (default) → _subagent_auto_deny (safe; matches leaf tool blocklist)
-#   true            → _subagent_auto_approve (opt-in YOLO for cron/batch)
+#   true            → _subagent_auto_approve (deprecated all-or-nothing mode)
 # Both emit a logger.warning for audit; gateway sessions are unaffected
 # because they resolve approvals via tools/approval.py's per-session queue,
 # not through these TLS callbacks.
@@ -99,18 +112,76 @@ def _subagent_auto_approve(command: str, description: str, **kwargs) -> str:
     return "once"
 
 
-def _get_subagent_approval_callback():
+# The consolidated guard preserves historical behavior for ordinary callbacks
+# in non-interactive contexts. Only worker-owned callbacks carry this marker.
+_subagent_auto_deny._hermes_noninteractive_worker_policy = True
+_subagent_auto_approve._hermes_noninteractive_worker_policy = True
+
+
+def _make_subagent_capability_authorizer(
+    grant: Optional[Dict[str, Any]],
+):
+    """Bind one content-addressed mission grant to terminal guard decisions."""
+
+    if not isinstance(grant, dict):
+        return None
+
+    def _authorizer(
+        command: str,
+        *,
+        effective_cwd: Optional[str] = None,
+        env_type: Optional[str] = None,
+    ) -> dict:
+        decision = evaluate_capability_command(
+            command,
+            grant,
+            effective_cwd=effective_cwd,
+            env_type=env_type,
+        )
+        if decision.get("matched"):
+            grant_id = (
+                (grant or {}).get("mission_grant_id")
+                or (grant or {}).get("grant_digest")
+                or "none"
+            )
+            logger.warning(
+                "Subagent capability %s %s command: %s (reason=%s; env=%s; cwd=%s)",
+                grant_id,
+                "approved" if decision.get("allowed") else "denied",
+                command,
+                decision.get("reason"),
+                env_type,
+                effective_cwd,
+            )
+        return decision
+
+    return _authorizer
+
+
+def _get_subagent_approval_callback(
+    capability_grant: Optional[Dict[str, Any]] = None,
+    *,
+    workspace_path: Optional[str] = None,
+):
     """Return the callback to install into subagent worker threads.
 
-    Config key: delegation.subagent_auto_approve (bool, default False).
-    Reads via the same _load_config() path as the rest of delegate_task so
-    priority is config.yaml > (no env override for this knob) > default.
+    Capability-sensitive commands are handled by the typed authorizer. When a
+    scoped grant is active, every other dangerous command remains denied.
+    Without a grant, preserve legacy delegation.subagent_auto_approve behavior.
     """
+    if isinstance(capability_grant, dict):
+        return _subagent_auto_deny
     cfg = _load_config()
     val = cfg.get("subagent_auto_approve", False)
     if is_truthy_value(val):
         return _subagent_auto_approve
     return _subagent_auto_deny
+
+
+def _install_subagent_terminal_policy(approval_callback, capability_authorizer) -> None:
+    """Install both worker-local terminal policies in executor threads."""
+    _set_subagent_approval_cb(approval_callback)
+    _set_subagent_capability_authorizer(capability_authorizer)
 
 # NOTE: nested delegation is granted by role='orchestrator' (which re-adds the
 # "delegation" toolset in _build_child_agent), NOT by the model naming toolsets
@@ -603,6 +674,7 @@ _MIN_SUMMARY_CHARS = 2000
 # detection lives in the heartbeat staleness monitor below. Users can opt back
 # in via delegation.child_timeout_seconds.
 DEFAULT_CHILD_TIMEOUT: Optional[float] = None
+SUBAGENT_TIMEOUT_CLEANUP_GRACE_SECONDS = 2.0  # bounded wait after interrupt on timeout
 _HEARTBEAT_INTERVAL = 30  # seconds between parent activity heartbeats during delegation
 # Stale-heartbeat thresholds. A child with no API-call progress is either:
 #   - idle between turns (no current_tool) — probably stuck on a slow API call
@@ -1091,6 +1163,9 @@ def _build_child_agent(
     # with one allowlisted route class).  None keeps the legacy behavior of
     # reading the top-level delegation block directly.
     delegation_route: Optional[Dict[str, Any]] = None,
+    # Resolved operator-configured mission capability grant. The model selects
+    # only its opaque name; the trusted config payload is bound to this goal.
+    capability_grant: Optional[Dict[str, Any]] = None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -1197,6 +1272,32 @@ def _build_child_agent(
         child_toolsets.append("delegation")
 
     workspace_hint = _resolve_workspace_hint(parent_agent)
+    bound_capability_grant = bind_capability_grant(capability_grant, goal)
+    mission_iteration_budget = None
+    mission_deadline_monotonic = None
+    if isinstance(bound_capability_grant, dict):
+        # One granted goal and all of its nested descendants share a single
+        # iteration counter and wall-clock deadline. Parallel batch items are
+        # distinct missions because each has its own goal-bound grant id.
+        mission_iteration_budget = getattr(
+            parent_agent, "_delegate_mission_iteration_budget", None
+        )
+        if mission_iteration_budget is None:
+            from agent.iteration_budget import IterationBudget
+
+            mission_iteration_budget = IterationBudget(max_iterations)
+        inherited_deadline = getattr(
+            parent_agent, "_delegate_mission_deadline_monotonic", None
+        )
+        if isinstance(inherited_deadline, (int, float)):
+            mission_deadline_monotonic = float(inherited_deadline)
+        else:
+            mission_timeout = capability_child_timeout(
+                bound_capability_grant,
+                _get_child_timeout(),
+            )
+            if mission_timeout and mission_timeout > 0:
+                mission_deadline_monotonic = time.monotonic() + float(mission_timeout)
     child_prompt = _build_child_system_prompt(
         goal,
         context,
@@ -1205,6 +1306,7 @@ def _build_child_agent(
         max_spawn_depth=max_spawn,
         child_depth=child_depth,
     )
+    child_prompt += capability_prompt_block(bound_capability_grant)
     # Extract parent's API key so subagents inherit auth (e.g. Nous Portal).
     parent_api_key = getattr(parent_agent, "api_key", None)
     if (not parent_api_key) and hasattr(parent_agent, "_client_kwargs"):
@@ -1230,10 +1332,8 @@ def _build_child_agent(
         session_ref=child_session_ref,
     )
 
-    # Each subagent gets its own iteration budget capped at max_iterations
-    # (configurable via delegation.max_iterations, default 50).  This means
-    # total iterations across parent + subagents can exceed the parent's
-    # max_iterations.  The user controls the per-subagent cap in config.yaml.
+    # Ungranted subagents keep the legacy independent iteration budget. A
+    # capability-granted mission shares one counter with nested descendants.
 
     child_thinking_cb = None
     if child_progress_cb:
@@ -1411,7 +1511,7 @@ def _build_child_agent(
             ),
             openrouter_min_coding_score=child_openrouter_min_coding_score,
             tool_progress_callback=child_progress_cb,
-            iteration_budget=None,  # fresh budget per subagent
+            iteration_budget=mission_iteration_budget,
             **child_optional_kwargs,
         )
     child._print_fn = getattr(parent_agent, "_print_fn", None)
@@ -1428,6 +1528,23 @@ def _build_child_agent(
     child._subagent_id = subagent_id
     child._parent_subagent_id = parent_subagent_id
     child._subagent_goal = goal
+    child._delegate_capability_grant = bound_capability_grant
+    child._delegate_capability_grant_name = (
+        bound_capability_grant.get("name")
+        if isinstance(bound_capability_grant, dict)
+        else None
+    )
+    child._delegate_capability_grant_id = (
+        bound_capability_grant.get("mission_grant_id")
+        if isinstance(bound_capability_grant, dict)
+        else None
+    )
+    child._delegate_workspace_path = workspace_hint
+    child._delegate_mission_iteration_budget = mission_iteration_budget
+    child._delegate_mission_deadline_monotonic = mission_deadline_monotonic
+    child._preserve_iteration_budget_across_turns = (
+        mission_iteration_budget is not None
+    )
     child._parent_turn_id = getattr(parent_agent, "_current_turn_id", "") or ""
     # Stable sidebar marker: delegate subagent sessions must stay out of
     # session pickers even when a parent delete orphans them (parent_session_id
@@ -1474,6 +1591,12 @@ def _build_child_agent(
             child_subagent_id=subagent_id,
             child_role=effective_role,
             child_goal=goal,
+            child_capability_grant=getattr(
+                child, "_delegate_capability_grant_name", None
+            ),
+            child_capability_grant_id=getattr(
+                child, "_delegate_capability_grant_id", None
+            ),
         )
     except Exception:
         logger.debug("subagent_start hook invocation failed", exc_info=True)
@@ -1489,15 +1612,17 @@ def _dump_subagent_timeout_diagnostic(
     duration_seconds: float,
     worker_thread: Optional[threading.Thread],
     goal: str,
+    cleanup_status: str = "unknown",
+    cleanup_error: Optional[str] = None,
 ) -> Optional[str]:
-    """Write a structured diagnostic dump for a subagent that timed out
-    before making any API call.
+    """Write a structured diagnostic dump for a timed-out subagent.
 
     See issue #14726: users hit "subagent timed out after 300s with no response"
-    with zero API calls and no way to inspect what happened. This helper
-    writes a dedicated log under ``~/.hermes/logs/subagent-<sid>-<ts>.log``
-    capturing the child's config, system-prompt / tool-schema sizes, activity
-    tracker snapshot, and the worker thread's Python stack at timeout.
+    with too little information to inspect what happened. This helper writes
+    a dedicated log under ``~/.hermes/logs/subagent-<sid>-<ts>.log`` capturing
+    the child's config, system-prompt / tool-schema sizes, activity tracker
+    snapshot, bounded cleanup result, and the worker thread's Python stack at
+    timeout.
 
     Returns the absolute path to the diagnostic file, or None on failure.
     """
@@ -1543,7 +1668,8 @@ def _dump_subagent_timeout_diagnostic(
         for attr in (
             "model", "provider", "api_mode", "base_url", "max_iterations",
             "quiet_mode", "skip_memory", "skip_context_files", "platform",
-            "_delegate_role", "_delegate_depth",
+            "_delegate_role", "_delegate_depth", "_delegate_route_class",
+            "_delegate_capability_grant_name", "_delegate_capability_grant_id",
         ):
             try:
                 val = getattr(child, attr, None)
@@ -1595,6 +1721,14 @@ def _dump_subagent_timeout_diagnostic(
             _w(f"  <get_activity_summary failed: {exc}>")
         _w("")
 
+        _w("## Cleanup after timeout")
+        _w(f"  interrupt_status: {cleanup_status}")
+        if cleanup_error:
+            _w(f"  cleanup_error: {cleanup_error}")
+        if worker_thread is not None:
+            _w(f"  worker_alive_after_interrupt: {worker_thread.is_alive()}")
+        _w("")
+
         _w("## Worker thread stack at timeout")
         if worker_thread is not None and worker_thread.is_alive():
             frames = _sys._current_frames()
@@ -1613,10 +1747,12 @@ def _dump_subagent_timeout_diagnostic(
         _w("")
 
         _w("## Notes")
-        _w("  This file is written ONLY when a subagent times out with 0 API calls.")
+        _w("  This file is written when a subagent times out.")
         _w("  0-API-call timeouts mean the child never reached its first LLM request.")
-        _w("  Common causes: oversized prompt rejected by provider, transport hang,")
-        _w("  credential resolution stuck. See issue #14726 for context.")
+        _w("  Nonzero-API-call timeouts usually mean a slow provider response,")
+        _w("  unresponsive network request, or a tool that did not observe interrupt.")
+        _w("  Common 0-call causes: oversized prompt rejected by provider,")
+        _w("  transport hang, credential resolution stuck. See issue #14726 for context.")
 
         dump_path.write_text("\n".join(lines), encoding="utf-8")
         return str(dump_path)
@@ -1941,6 +2077,12 @@ def _run_single_child(
                     else None
                 ),
                 "route_class": getattr(child, "_delegate_route_class", None),
+                "capability_grant": getattr(
+                    child, "_delegate_capability_grant_name", None
+                ),
+                "capability_grant_id": getattr(
+                    child, "_delegate_capability_grant_id", None
+                ),
                 "started_at": time.time(),
                 "status": "running",
                 "tool_count": 0,
@@ -1984,19 +2126,38 @@ def _run_single_child(
         # Run child with an optional hard timeout (off by default —
         # result(timeout=None) blocks until the child finishes). Stuck-child
         # protection comes from the heartbeat staleness monitor instead.
-        child_timeout = _get_child_timeout()
+        child_timeout = capability_child_timeout(
+            getattr(child, "_delegate_capability_grant", None),
+            _get_child_timeout(),
+        )
+        mission_deadline = getattr(
+            child, "_delegate_mission_deadline_monotonic", None
+        )
+        if isinstance(mission_deadline, (int, float)):
+            remaining = max(0.001, float(mission_deadline) - time.monotonic())
+            child_timeout = (
+                min(float(child_timeout), remaining)
+                if child_timeout and child_timeout > 0
+                else remaining
+            )
         # Daemon worker (tools.daemon_pool): a timed-out child is abandoned
         # below; a stdlib non-daemon worker would then block interpreter
         # exit at atexit-join time if the child never unwinds.
         from tools.daemon_pool import DaemonThreadPoolExecutor
         _timeout_executor = DaemonThreadPoolExecutor(
             max_workers=1,
-            # Install a non-interactive approval callback in the worker thread
-            # so dangerous-command prompts from the subagent don't fall back to
-            # input() and deadlock the parent's prompt_toolkit TUI.
-            # Callback (deny vs approve) is governed by delegation.subagent_auto_approve.
-            initializer=_set_subagent_approval_cb,
-            initargs=(_get_subagent_approval_callback(),),
+            # Install both the legacy dangerous-command fallback and the typed
+            # mission capability authorizer in the worker thread. The latter is
+            # enforced inside the terminal guard across every runtime context.
+            initializer=_install_subagent_terminal_policy,
+            initargs=(
+                _get_subagent_approval_callback(
+                    getattr(child, "_delegate_capability_grant", None),
+                ),
+                _make_subagent_capability_authorizer(
+                    getattr(child, "_delegate_capability_grant", None)
+                ),
+            ),
         )
         # Capture the worker thread so the timeout diagnostic can dump its
         # Python stack (see #14726 — 0-API-call hangs are opaque without it).
@@ -2027,28 +2188,45 @@ def _run_single_child(
         _child_future = _timeout_executor.submit(_run_with_thread_capture)
         try:
             result = _child_future.result(timeout=child_timeout)
-        except Exception as _timeout_exc:
-            # Signal the child to stop so its thread can exit cleanly.
+        except FuturesTimeoutError as _timeout_exc:
+            # Signal the child to stop so its thread can exit cleanly, then
+            # wait a small bounded grace period to observe whether cleanup
+            # actually completed.  Do not block indefinitely: a child can be
+            # wedged in blocking I/O that never observes the interrupt flag.
+            cleanup_status = "interrupt_unavailable"
+            cleanup_error: Optional[str] = None
             try:
                 if hasattr(child, "interrupt"):
                     child.interrupt()
+                    cleanup_status = "interrupt_requested"
                 elif hasattr(child, "_interrupt_requested"):
                     child._interrupt_requested = True
-            except Exception:
-                pass
+                    cleanup_status = "interrupt_flag_set"
+            except Exception as exc:
+                cleanup_status = "interrupt_failed"
+                cleanup_error = f"{type(exc).__name__}: {exc}"
 
-            is_timeout = isinstance(_timeout_exc, (FuturesTimeoutError, TimeoutError))
+            if cleanup_status in {"interrupt_requested", "interrupt_flag_set"}:
+                try:
+                    _child_future.result(timeout=SUBAGENT_TIMEOUT_CLEANUP_GRACE_SECONDS)
+                    cleanup_status = "worker_exited_after_interrupt"
+                except FuturesTimeoutError:
+                    cleanup_status = "worker_still_running_after_interrupt"
+                except Exception as exc:
+                    cleanup_status = "worker_exited_with_error_after_interrupt"
+                    cleanup_error = f"{type(exc).__name__}: {exc}"
+
             duration = round(time.monotonic() - child_start, 2)
             logger.warning(
-                "Subagent %d %s after %.1fs",
+                "Subagent %d timed out after %.1fs (cleanup=%s)",
                 task_index,
-                "timed out" if is_timeout else f"raised {type(_timeout_exc).__name__}",
                 duration,
+                cleanup_status,
             )
 
-            # When a subagent times out BEFORE making any API call, dump a
-            # diagnostic to help users (and us) see what the child was doing.
-            # See #14726 — without this, 0-API-call hangs are black boxes.
+            # Always write a timeout diagnostic now.  0-call hangs are still
+            # called out, but nonzero-call timeouts also need a stack + cleanup
+            # artifact for operators to decide whether a tool/provider hung.
             diagnostic_path: Optional[str] = None
             child_api_calls = 0
             try:
@@ -2056,68 +2234,78 @@ def _run_single_child(
                 child_api_calls = int(_summary.get("api_call_count", 0) or 0)
             except Exception:
                 pass
-            if is_timeout and child_api_calls == 0:
-                diagnostic_path = _dump_subagent_timeout_diagnostic(
-                    child=child,
-                    task_index=task_index,
-                    # is_timeout implies a cap was configured (result(timeout=None)
-                    # never raises FuturesTimeoutError); guard for the type checker.
-                    timeout_seconds=float(child_timeout or 0.0),
-                    duration_seconds=float(duration),
-                    worker_thread=_worker_thread_holder.get("t"),
-                    goal=goal,
+            diagnostic_path = _dump_subagent_timeout_diagnostic(
+                child=child,
+                task_index=task_index,
+                # FuturesTimeoutError means a cap was configured; guard for the
+                # type checker because the default is now no timeout.
+                timeout_seconds=float(child_timeout or 0.0),
+                duration_seconds=float(duration),
+                worker_thread=_worker_thread_holder.get("t"),
+                goal=goal,
+                cleanup_status=cleanup_status,
+                cleanup_error=cleanup_error,
+            )
+            if diagnostic_path:
+                logger.warning(
+                    "Subagent %d timeout diagnostic written to %s",
+                    task_index,
+                    diagnostic_path,
                 )
-                if diagnostic_path:
-                    logger.warning(
-                        "Subagent %d 0-API-call timeout — diagnostic written to %s",
-                        task_index,
-                        diagnostic_path,
-                    )
 
             if child_progress_cb:
                 try:
                     child_progress_cb(
+                        "subagent.timeout_cleanup",
+                        preview=cleanup_status,
+                        status="timeout",
+                        duration_seconds=duration,
+                        diagnostic_path=diagnostic_path or "",
+                    )
+                    child_progress_cb(
                         "subagent.complete",
-                        preview=(
-                            f"Timed out after {duration}s"
-                            if is_timeout
-                            else str(_timeout_exc)
-                        ),
-                        status="timeout" if is_timeout else "error",
+                        preview=f"Timed out after {duration}s",
+                        status="timeout",
                         duration_seconds=duration,
                         summary="",
+                        diagnostic_path=diagnostic_path or "",
                     )
                 except Exception:
                     pass
 
-            if is_timeout:
-                if child_api_calls == 0:
-                    _err = (
-                        f"Subagent timed out after {child_timeout}s without "
-                        f"making any API call — the child never reached its "
-                        f"first LLM request (prompt construction, credential "
-                        f"resolution, or transport may be stuck)."
-                    )
-                    if diagnostic_path:
-                        _err += f" Diagnostic: {diagnostic_path}"
-                else:
-                    _err = (
-                        f"Subagent timed out after {child_timeout}s with "
-                        f"{child_api_calls} API call(s) completed — likely "
-                        f"stuck on a slow API call or unresponsive network request."
-                    )
+            if child_api_calls == 0:
+                _err = (
+                    f"Subagent timed out after {child_timeout}s without "
+                    f"making any API call — the child never reached its "
+                    f"first LLM request (prompt construction, credential "
+                    f"resolution, or transport may be stuck)."
+                )
             else:
-                _err = str(_timeout_exc)
+                _err = (
+                    f"Subagent timed out after {child_timeout}s with "
+                    f"{child_api_calls} API call(s) completed — likely "
+                    f"stuck on a slow API call, unresponsive network request, "
+                    f"or tool cleanup that did not observe interrupt."
+                )
+            _err += f" Cleanup: {cleanup_status}."
+            if diagnostic_path:
+                _err += f" Diagnostic: {diagnostic_path}"
 
             return {
                 "task_index": task_index,
-                "status": "timeout" if is_timeout else "error",
+                "status": "timeout",
                 "summary": None,
                 "error": _err,
-                "exit_reason": "timeout" if is_timeout else "error",
+                "exit_reason": "timeout",
                 "api_calls": child_api_calls,
                 "duration_seconds": duration,
                 "route_class": getattr(child, "_delegate_route_class", None),
+                "capability_grant": getattr(
+                    child, "_delegate_capability_grant_name", None
+                ),
+                "capability_grant_id": getattr(
+                    child, "_delegate_capability_grant_id", None
+                ),
                 "_child_role": getattr(child, "_delegate_role", None),
                 "diagnostic_path": diagnostic_path,
                 "cleanup_status": cleanup_status,
@@ -2150,13 +2338,23 @@ def _run_single_child(
                 "api_calls": 0,
                 "duration_seconds": duration,
                 "route_class": getattr(child, "_delegate_route_class", None),
+                "capability_grant": getattr(
+                    child, "_delegate_capability_grant_name", None
+                ),
+                "capability_grant_id": getattr(
+                    child, "_delegate_capability_grant_id", None
+                ),
                 "_child_role": getattr(child, "_delegate_role", None),
                 "diagnostic_path": None,
             }
         finally:
             # Shut down executor without waiting — if the child thread
-            # is stuck on blocking I/O, wait=True would hang forever.
-            _timeout_executor.shutdown(wait=False)
+            # is stuck on blocking I/O, wait=True would hang forever.  Also
+            # cancel any not-yet-started futures defensively.
+            try:
+                _timeout_executor.shutdown(wait=False, cancel_futures=True)
+            except TypeError:
+                _timeout_executor.shutdown(wait=False)
 
         # Flush any remaining batched progress to gateway
         if child_progress_cb and hasattr(child_progress_cb, "_flush"):
@@ -2246,6 +2444,12 @@ def _run_single_child(
             "duration_seconds": duration,
             "model": _model if isinstance(_model, str) else None,
             "route_class": getattr(child, "_delegate_route_class", None),
+            "capability_grant": getattr(
+                child, "_delegate_capability_grant_name", None
+            ),
+            "capability_grant_id": getattr(
+                child, "_delegate_capability_grant_id", None
+            ),
             "exit_reason": exit_reason,
             "tokens": {
                 "input": (
@@ -2550,7 +2754,13 @@ def _select_delegation_route(
     effective = {
         key: copy.deepcopy(value)
         for key, value in cfg.items()
-        if key not in {"default_route_class", "route_classes"}
+        if key
+        not in {
+            "default_route_class",
+            "route_classes",
+            "default_capability_grant",
+            "capability_grants",
+        }
     }
     for key, value in selected.items():
         effective[key] = copy.deepcopy(value)
@@ -2564,6 +2774,7 @@ def delegate_task(
     max_iterations: Optional[int] = None,
     role: Optional[str] = None,
     route_class: Optional[str] = None,
+    capability_grant: Optional[str] = None,
     background: Optional[bool] = None,
     parent_agent=None,
 ) -> str:
@@ -2571,8 +2782,10 @@ def delegate_task(
     Spawn one or more child agents to handle delegated tasks.
 
     Supports two modes:
-      - Single: provide goal (+ optional context, role, route_class)
-      - Batch:  provide tasks array [{goal, context, role, route_class}, ...]
+      - Single: provide goal (+ optional context, role, route_class,
+        capability_grant)
+      - Batch: provide tasks array [{goal, context, role, route_class,
+        capability_grant}, ...]
 
     The 'role' parameter controls whether a child can further delegate:
     'leaf' (default) cannot; 'orchestrator' retains the delegation
@@ -2583,6 +2796,11 @@ def delegate_task(
     Per-task route_class beats the top-level selector; omission uses
     delegation.default_route_class when configured, otherwise the legacy
     delegation.provider/model route.
+
+    ``capability_grant`` may select only an operator-configured opaque grant.
+    The trusted grant payload is bound to the child goal and controls bounded
+    dangerous-command auto-approval. Nested workers inherit the exact parent
+    grant and cannot select a broader one.
 
     Returns JSON with results array, one entry per task.
     """
@@ -2668,6 +2886,7 @@ def delegate_task(
                 "context": context,
                 "role": top_role,
                 "route_class": route_class,
+                "capability_grant": capability_grant,
             }
         ]
     else:
@@ -2690,11 +2909,41 @@ def delegate_task(
     # resolution stays on the existing runtime-provider path and therefore
     # retains global/profile credential-pool inheritance.
     prepared_routes: List[tuple[Optional[str], dict, dict]] = []
+    prepared_grants: List[tuple[Optional[str], Optional[dict]]] = []
+    raw_inherited_grant_name = (
+        getattr(parent_agent, "_delegate_capability_grant_name", None)
+        if depth > 0
+        else None
+    )
+    inherited_grant_name = (
+        raw_inherited_grant_name
+        if isinstance(raw_inherited_grant_name, str)
+        and raw_inherited_grant_name.strip()
+        else None
+    )
+    raw_inherited_grant = (
+        getattr(parent_agent, "_delegate_capability_grant", None)
+        if depth > 0
+        else None
+    )
+    inherited_grant = (
+        raw_inherited_grant if isinstance(raw_inherited_grant, dict) else None
+    )
     for task in task_list:
         requested_class = task.get("route_class")
         if requested_class is None:
             requested_class = route_class
+        requested_grant = task.get("capability_grant")
+        if requested_grant is None:
+            requested_grant = capability_grant
         try:
+            selected_grant_name, effective_grant = select_capability_grant(
+                cfg,
+                requested_grant,
+                inherited_name=inherited_grant_name,
+                inherited_grant=inherited_grant,
+                inherit_from_parent=(depth > 0),
+            )
             selected_class, effective_route = _select_delegation_route(
                 cfg,
                 requested_class,
@@ -2703,11 +2952,34 @@ def delegate_task(
                 effective_route,
                 parent_agent,
             )
+            if isinstance(effective_grant, dict):
+                inherits_parent_transport = not credentials.get(
+                    "provider"
+                ) and not credentials.get("base_url")
+                parent_acp_command = getattr(parent_agent, "acp_command", None)
+                if not isinstance(parent_acp_command, str):
+                    parent_acp_command = None
+                parent_api_mode = getattr(parent_agent, "api_mode", None)
+                if not isinstance(parent_api_mode, str):
+                    parent_api_mode = None
+                effective_acp_command = credentials.get("command") or (
+                    parent_acp_command if inherits_parent_transport else None
+                )
+                effective_api_mode = credentials.get("api_mode") or (
+                    parent_api_mode if inherits_parent_transport else None
+                )
+                if effective_acp_command or effective_api_mode == "codex_app_server":
+                    raise ValueError(
+                        "delegation capability_grant is not supported with ACP "
+                        "or codex_app_server delegation routes because those "
+                        "transports execute tools outside the Hermes mission guard."
+                    )
         except ValueError as exc:
             return tool_error(str(exc))
         prepared_routes.append(
             (selected_class, effective_route, credentials)
         )
+        prepared_grants.append((selected_grant_name, effective_grant))
 
     overall_start = time.monotonic()
     results = []
@@ -2757,6 +3029,7 @@ def delegate_task(
     try:
         for i, t in enumerate(task_list):
             selected_class, effective_route, creds = prepared_routes[i]
+            selected_grant_name, effective_grant = prepared_grants[i]
             # Per-task role beats top-level; normalise again so unknown
             # per-task values warn and degrade to leaf uniformly.
             effective_role = _normalize_role(t.get("role") or top_role)
@@ -2768,7 +3041,10 @@ def delegate_task(
                 # cannot choose or narrow them (no model-facing toolsets arg).
                 toolsets=None,
                 model=creds["model"],
-                max_iterations=effective_max_iter,
+                max_iterations=capability_max_iterations(
+                    effective_grant,
+                    effective_max_iter,
+                ),
                 task_count=n_tasks,
                 parent_agent=parent_agent,
                 override_provider=creds["provider"],
@@ -2781,8 +3057,10 @@ def delegate_task(
                 override_acp_args=creds.get("args"),
                 role=effective_role,
                 delegation_route=effective_route,
+                capability_grant=effective_grant,
             )
             child._delegate_route_class = selected_class
+            child._delegate_capability_grant_name = selected_grant_name
             # Override with correct parent tool names (before child construction mutated global)
             child._delegate_saved_tool_names = _parent_tool_names
             # Tee the child's progress events into its live transcript log.
@@ -3394,7 +3672,19 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
     _provider_lower = (configured_provider or "").strip().lower()
     _is_native_sdk_provider = _provider_lower in _NATIVE_SDK_PROVIDERS
 
-    if configured_base_url and not _is_native_sdk_provider:
+    # base_url alone (or with provider=custom / an explicit api_key) means a
+    # direct OpenAI-compatible endpoint. Named providers with base_url but NO
+    # explicit key (Team A xai + https://api.x.ai/v1) must still resolve the
+    # real provider credential pool / env key — otherwise children become
+    # provider=custom and inherit a parent key that is often Codex/empty,
+    # producing xAI "Incorrect API key provided".
+    _use_direct_base_url = bool(configured_base_url) and not _is_native_sdk_provider and (
+        not _provider_lower
+        or _provider_lower == "custom"
+        or bool(configured_api_key)
+    )
+
+    if _use_direct_base_url:
         # When delegation.api_key is not set, return None so _build_child_agent
         # falls back to the parent agent's API key via the credential inheritance
         # path (effective_api_key = override_api_key or parent_api_key). This
@@ -3475,7 +3765,9 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
     return {
         "model": configured_model or runtime.get("model") or None,
         "provider": configured_provider if runtime.get("provider") == _RUNTIME_PROVIDER_CUSTOM else runtime.get("provider"),
-        "base_url": runtime.get("base_url"),
+        # Honor an explicit base_url override after named-provider credential
+        # resolution (e.g. regional endpoint) without demoting to custom.
+        "base_url": configured_base_url or runtime.get("base_url"),
         "api_key": api_key,
         "api_mode": runtime.get("api_mode"),
         "request_overrides": dict(runtime.get("request_overrides") or {}),
@@ -3553,6 +3845,10 @@ def _build_top_level_description() -> str:
     cfg = _load_config()
     route_classes = _configured_route_class_names(cfg)
     default_route_class = str(cfg.get("default_route_class") or "").strip()
+    capability_grants = configured_capability_grant_names(cfg)
+    default_capability_grant = str(
+        cfg.get("default_capability_grant") or ""
+    ).strip()
 
     if max_depth >= 2 and orchestrator_on:
         nesting_clause = (
@@ -3593,6 +3889,25 @@ def _build_top_level_description() -> str:
             "Subagent model is not selectable per call: children inherit the "
             "parent model (plus its fallback chain) unless all subagents are "
             "pinned through delegation.provider / delegation.model in config.yaml."
+        )
+
+    if capability_grants:
+        grant_list = ", ".join(capability_grants)
+        grant_default_note = (
+            f" Omit capability_grant to inherit/use {default_capability_grant!r}."
+            if default_capability_grant in capability_grants
+            else " Omit capability_grant to run without scoped maintenance auto-approval."
+        )
+        capability_clause = (
+            "Scoped controller/service authority is selectable only through the "
+            f"configured capability_grant allowlist ({grant_list})."
+            f"{grant_default_note} Nested workers inherit the same grant and "
+            "cannot expand it."
+        )
+    else:
+        capability_clause = (
+            "No scoped capability grants are configured; dangerous commands "
+            "use the legacy non-interactive deny/auto-approve setting."
         )
 
     return (
@@ -3656,6 +3971,7 @@ def _build_top_level_description() -> str:
         f"user and can be disabled globally via "
         "delegation.orchestrator_enabled=false.\n"
         f"- {route_clause}\n"
+        f"- {capability_clause}\n"
         "- Each subagent gets its own terminal session (separate working directory and state).\n"
         "- Results are always returned as an array, one entry per task."
     )
@@ -3729,6 +4045,25 @@ def _build_route_class_param_description(cfg: Optional[dict] = None) -> str:
     )
 
 
+def _build_capability_grant_param_description(cfg: Optional[dict] = None) -> str:
+    cfg = cfg if isinstance(cfg, dict) else _load_config()
+    names = configured_capability_grant_names(cfg)
+    default_name = str(cfg.get("default_capability_grant") or "").strip()
+    choices = ", ".join(names)
+    default_note = (
+        f" Omit it to use/inherit {default_name!r}."
+        if default_name in names
+        else " Omit it to run without scoped dangerous-command authority."
+    )
+    return (
+        "Operator-configured mission capability grant for this child. "
+        f"Allowed values: {choices}.{default_note} The selected opaque grant "
+        "is content-addressed, bound to this goal, and inherited unchanged by "
+        "nested workers; arbitrary roots, services, commands, or boundaries "
+        "cannot be supplied here."
+    )
+
+
 def _build_dynamic_schema_overrides() -> dict:
     """Return per-call schema overrides reflecting current config.
 
@@ -3742,6 +4077,7 @@ def _build_dynamic_schema_overrides() -> dict:
 
     cfg = _load_config()
     route_classes = _configured_route_class_names(cfg)
+    capability_grants = configured_capability_grant_names(cfg)
     top_properties = overrides_params["properties"]
     task_properties = top_properties["tasks"]["items"]["properties"]
     if route_classes:
@@ -3755,6 +4091,15 @@ def _build_dynamic_schema_overrides() -> dict:
         # programmatic unknown class.
         top_properties.pop("route_class", None)
         task_properties.pop("route_class", None)
+
+    if capability_grants:
+        grant_description = _build_capability_grant_param_description(cfg)
+        for properties in (top_properties, task_properties):
+            properties["capability_grant"]["enum"] = capability_grants
+            properties["capability_grant"]["description"] = grant_description
+    else:
+        top_properties.pop("capability_grant", None)
+        task_properties.pop("capability_grant", None)
 
     return {
         "description": _build_top_level_description(),
@@ -3815,6 +4160,10 @@ DELEGATE_TASK_SCHEMA = {
                             "type": "string",
                             "description": "(rebuilt at get_definitions() time)",
                         },
+                        "capability_grant": {
+                            "type": "string",
+                            "description": "(rebuilt at get_definitions() time)",
+                        },
                     },
                     "required": ["goal"],
                 },
@@ -3829,6 +4178,10 @@ DELEGATE_TASK_SCHEMA = {
                 "description": "(rebuilt at get_definitions() time)",
             },
             "route_class": {
+                "type": "string",
+                "description": "(rebuilt at get_definitions() time)",
+            },
+            "capability_grant": {
                 "type": "string",
                 "description": "(rebuilt at get_definitions() time)",
             },
@@ -3904,6 +4257,7 @@ registry.register(
         max_iterations=args.get("max_iterations"),
         role=args.get("role"),
         route_class=args.get("route_class"),
+        capability_grant=args.get("capability_grant"),
         background=_model_background_value(args, kw.get("parent_agent")),
         parent_agent=kw.get("parent_agent"),
     ),

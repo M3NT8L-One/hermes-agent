@@ -6581,6 +6581,7 @@ class AIAgent:
             max_iterations=function_args.get("max_iterations"),
             role=function_args.get("role"),
             route_class=function_args.get("route_class"),
+            capability_grant=function_args.get("capability_grant"),
             background=(not _is_subagent),
             parent_agent=self,
         )

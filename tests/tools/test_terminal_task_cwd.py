@@ -1,6 +1,7 @@
 """Regression tests for task/session cwd propagation in terminal_tool."""
 
 import json
+import os
 from types import SimpleNamespace
 
 import tools.terminal_tool as terminal_tool
@@ -76,8 +77,174 @@ def test_explicit_workdir_still_wins_over_registered_task_cwd(monkeypatch):
     assert calls == [{"timeout": 60, "cwd": "/explicit/workdir", "bounded_capture": True}]
 
 
-def test_foreground_command_prefers_recorded_session_cwd_over_init_time_cwd(monkeypatch):
-    """A prior `cd` records the session cwd; terminal_tool must honor it."""
+def test_guard_receives_exact_explicit_workdir_before_execution(monkeypatch):
+    executed = []
+    guarded = []
+
+    class FakeEnv:
+        env = {}
+        cwd = "/workspace/live"
+
+        def execute(self, command, **kwargs):
+            executed.append((command, kwargs))
+            return {"output": "ok", "returncode": 0}
+
+    task_id = "delegated-capability-cwd"
+    monkeypatch.setattr(terminal_tool, "_active_environments", {task_id: FakeEnv()})
+    monkeypatch.setattr(terminal_tool, "_last_activity", {})
+    monkeypatch.setattr(terminal_tool, "_task_env_overrides", {})
+    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: _minimal_terminal_config())
+    monkeypatch.setattr(terminal_tool, "_start_cleanup_thread", lambda: None)
+    monkeypatch.setattr(terminal_tool, "_resolve_container_task_id", lambda value: value or "default")
+
+    def guard(command, env_type, **kwargs):
+        guarded.append((command, env_type, kwargs))
+        return {
+            "approved": kwargs.get("effective_cwd") == "/workspace/allowed",
+            "message": "outside capability root",
+            "description": "controller_cwd_outside_grant",
+        }
+
+    monkeypatch.setattr(terminal_tool, "_check_all_guards", guard)
+
+    allowed = json.loads(
+        terminal_tool.terminal_tool(
+            command="project-controller repair",
+            task_id=task_id,
+            workdir="/workspace/allowed",
+        )
+    )
+    denied = json.loads(
+        terminal_tool.terminal_tool(
+            command="project-controller repair",
+            task_id=task_id,
+            workdir="/workspace/other",
+        )
+    )
+
+    assert allowed["exit_code"] == 0
+    assert denied["status"] == "blocked"
+    assert executed == [
+        (
+            "project-controller repair",
+            {
+                "timeout": 60,
+                "cwd": "/workspace/allowed",
+                "bounded_capture": True,
+            },
+        )
+    ]
+    assert [item[2]["effective_cwd"] for item in guarded] == [
+        "/workspace/allowed",
+        "/workspace/other",
+    ]
+
+
+def test_terminal_executes_typed_capability_guard_before_safe_service_command(
+    monkeypatch,
+):
+    executed = []
+
+    class FakeEnv:
+        env = {}
+        cwd = "/workspace/project"
+
+        def execute(self, command, **kwargs):
+            executed.append((command, kwargs))
+            return {"output": "unexpected", "returncode": 0}
+
+    task_id = "delegated-capability-terminal"
+    monkeypatch.setattr(terminal_tool, "_active_environments", {task_id: FakeEnv()})
+    monkeypatch.setattr(terminal_tool, "_last_activity", {})
+    monkeypatch.setattr(terminal_tool, "_task_env_overrides", {})
+    monkeypatch.setattr(
+        terminal_tool,
+        "_get_env_config",
+        lambda: _minimal_terminal_config(cwd="/workspace/project"),
+    )
+    monkeypatch.setattr(terminal_tool, "_start_cleanup_thread", lambda: None)
+    monkeypatch.setattr(terminal_tool, "_resolve_container_task_id", lambda value: value or "default")
+    monkeypatch.delenv("_HERMES_GATEWAY", raising=False)
+
+    def capability(command, *, effective_cwd=None, env_type=None):
+        assert effective_cwd == "/workspace/project"
+        assert env_type == "local"
+        return {
+            "matched": True,
+            "allowed": False,
+            "reason": "service_target_not_granted",
+        }
+
+    terminal_tool.set_capability_authorizer(capability)
+    try:
+        result = json.loads(
+            terminal_tool.terminal_tool(
+                command=(
+                    "systemctl restart ai.example.worker"
+                ),
+                task_id=task_id,
+            )
+        )
+    finally:
+        terminal_tool.set_capability_authorizer(None)
+
+    assert result["status"] == "blocked"
+    assert "service_target_not_granted" in result["error"]
+    assert executed == []
+
+
+def test_force_cannot_bypass_scoped_capability_guard(monkeypatch):
+    """The internal approval-replay flag cannot broaden a child mission."""
+    executed = []
+
+    class FakeEnv:
+        env = {}
+        cwd = "/workspace/project"
+
+        def execute(self, command, **kwargs):
+            executed.append((command, kwargs))
+            return {"output": "ran", "returncode": 0}
+
+    task_id = "delegated-capability-force"
+    monkeypatch.setattr(terminal_tool, "_active_environments", {task_id: FakeEnv()})
+    monkeypatch.setattr(terminal_tool, "_last_activity", {})
+    monkeypatch.setattr(terminal_tool, "_task_env_overrides", {})
+    monkeypatch.setattr(
+        terminal_tool, "_get_env_config", lambda: _minimal_terminal_config()
+    )
+    monkeypatch.setattr(terminal_tool, "_start_cleanup_thread", lambda: None)
+    monkeypatch.setattr(
+        terminal_tool,
+        "_resolve_container_task_id",
+        lambda value: value or "default",
+    )
+    monkeypatch.delenv("_HERMES_GATEWAY", raising=False)
+
+    terminal_tool.set_capability_authorizer(
+        lambda command, **kwargs: {
+            "matched": True,
+            "allowed": False,
+            "reason": "force_scope_test",
+        }
+    )
+    try:
+        result = json.loads(
+            terminal_tool.terminal_tool(
+                command="echo should-not-run",
+                task_id=task_id,
+                force=True,
+            )
+        )
+    finally:
+        terminal_tool.set_capability_authorizer(None)
+
+    assert result["status"] == "blocked"
+    assert "force_scope_test" in result["error"]
+    assert executed == []
+
+
+def test_foreground_command_prefers_live_env_cwd_over_init_time_cwd(monkeypatch):
+    """A prior `cd` updates env.cwd; terminal_tool must honor that live cwd."""
     calls = []
 
     class FakeEnv:

@@ -1974,9 +1974,22 @@ def _is_verification_artifact_cleanup(command: str) -> bool:
         return False
 
     operand = argv[2]
-    temp_dir = os.path.realpath(tempfile.gettempdir())
+    raw_temp_dir = os.path.abspath(tempfile.gettempdir())
+    temp_dir = os.path.realpath(raw_temp_dir)
     basename = os.path.basename(operand)
-    if operand != os.path.join(temp_dir, basename):
+    operand_dir = os.path.dirname(operand)
+
+    # Preserve the strict direct-child spelling check used to reject nested,
+    # traversal, and duplicate-separator variants. macOS is the one standard
+    # exception: /tmp is an OS-managed alias for /private/tmp, so accept that
+    # exact alias as well as the canonical directory. Arbitrary symlinked temp
+    # directories remain canonical-target-only.
+    allowed_operand_dirs = {temp_dir}
+    if sys.platform == "darwin" and raw_temp_dir == "/tmp" and temp_dir == "/private/tmp":
+        allowed_operand_dirs.add(raw_temp_dir)
+    if operand_dir not in allowed_operand_dirs:
+        return False
+    if operand != os.path.join(operand_dir, basename):
         return False
 
     target = os.path.realpath(operand)
@@ -3179,7 +3192,9 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
 
 def check_all_command_guards(command: str, env_type: str,
                              approval_callback=None,
-                             has_host_access: bool = False) -> dict:
+                             has_host_access: bool = False,
+                             capability_callback=None,
+                             effective_cwd: str | None = None) -> dict:
     """Run all pre-exec security checks and return a single approval decision.
 
     Gathers findings from tirith and dangerous-command detection, then
@@ -3190,10 +3205,21 @@ def check_all_command_guards(command: str, env_type: str,
     ``has_host_access`` is True when a Docker sandbox bind-mounts host paths;
     such a session is no longer isolated, so it goes through the normal flow
     instead of the container fast-path.
+
+    ``capability_callback`` is a typed delegated-mission authorizer. It runs
+    after immutable hardline/sudo/user-deny checks but before every contextual
+    fast path (CLI, gateway, cron, async, yolo). A matched command is either
+    approved exactly once by the scoped grant or denied fail-closed.
     """
-    # Skip isolated container backends for both checks. Docker stops skipping
-    # once host paths are bind-mounted into the sandbox.
-    if _should_skip_container_guards(env_type, has_host_access=has_host_access):
+    # Skip isolated container backends for ordinary commands. A scoped mission
+    # still evaluates its typed authorizer so changing backend cannot broaden
+    # grant authority. Docker stops skipping once host paths are bind-mounted.
+    if (
+        capability_callback is None
+        and _should_skip_container_guards(
+            env_type, has_host_access=has_host_access
+        )
+    ):
         return {"approved": True, "message": None}
 
     # Hardline floor: unconditional block for catastrophic commands
@@ -3225,13 +3251,112 @@ def check_all_command_guards(command: str, env_type: str,
                        deny_pattern, command[:200])
         return _user_deny_block_result(deny_pattern)
 
+    # Delegated mission capability policy. This is intentionally ahead of
+    # yolo/permanent/non-interactive shortcuts: a worker cannot broaden an
+    # operator-owned mission grant by changing execution context. The callback
+    # receives the already validated cwd that terminal_tool will execute in.
+    if capability_callback is not None:
+        try:
+            capability = capability_callback(
+                command,
+                effective_cwd=effective_cwd,
+                env_type=env_type,
+            )
+        except Exception as exc:
+            logger.exception("Delegated capability authorizer failed")
+            return {
+                "approved": False,
+                "message": (
+                    "BLOCKED: delegated capability authorization failed closed "
+                    f"({type(exc).__name__})."
+                ),
+                "description": "capability_authorizer_error",
+            }
+        if not isinstance(capability, dict):
+            return {
+                "approved": False,
+                "message": "BLOCKED: delegated capability authorizer returned an invalid decision.",
+                "description": "capability_authorizer_invalid",
+            }
+        if capability.get("matched"):
+            reason = str(capability.get("reason") or "capability_policy")
+            if capability.get("allowed") is True:
+                logger.warning(
+                    "Delegated capability approved command once (%s): %s",
+                    reason,
+                    command[:200],
+                )
+                return {
+                    "approved": True,
+                    "message": None,
+                    "capability_approved": True,
+                    "description": reason,
+                }
+            logger.warning(
+                "Delegated capability denied command (%s): %s",
+                reason,
+                command[:200],
+            )
+            return {
+                "approved": False,
+                "message": (
+                    "BLOCKED: command is outside the delegated mission capability "
+                    f"grant ({reason}). Do not retry through a different spelling."
+                ),
+                "description": reason,
+                "capability_denied": True,
+            }
+
+    worker_policy = bool(
+        approval_callback is not None
+        and getattr(
+            approval_callback, "_hermes_noninteractive_worker_policy", False
+        )
+        is True
+    )
+    # A delegated worker callback is authoritative for every dangerous command,
+    # including commands not matched by a selected typed grant. Resolve it
+    # before yolo, mode=off, permanent/session approvals, and runtime-context
+    # fast paths so those ambient settings cannot broaden a child mission.
+    if worker_policy:
+        is_dangerous, pattern_key, description = detect_dangerous_command(command)
+        if is_dangerous:
+            try:
+                choice = approval_callback(
+                    command,
+                    description,
+                    pattern_key=pattern_key,
+                )
+            except Exception:
+                logger.exception("Subagent approval callback failed")
+                choice = "deny"
+            if choice in {"once", "session", "always"}:
+                return {
+                    "approved": True,
+                    "message": None,
+                    "subagent_approved": True,
+                    "description": description,
+                }
+            return {
+                "approved": False,
+                "message": (
+                    "BLOCKED: delegated worker policy denied a dangerous "
+                    f"command ({description})."
+                ),
+                "description": description,
+            }
+
     # --yolo or approvals.mode=off: bypass all approval prompts.
     # Gateway /yolo is session-scoped; CLI --yolo remains process-scoped.
     approval_mode = _get_approval_mode()
-    if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled() or approval_mode == "off":
+    if not worker_policy and (
+        _YOLO_MODE_FROZEN
+        or is_current_session_yolo_enabled()
+        or approval_mode == "off"
+    ):
         return {"approved": True, "message": None}
 
-    if _command_matches_permanent_allowlist(command):
+    if not worker_policy and _command_matches_permanent_allowlist(command):
         return {"approved": True, "message": None}
 
     is_cli = _is_interactive_cli()
@@ -3240,7 +3365,7 @@ def check_all_command_guards(command: str, env_type: str,
 
     # Preserve the existing non-interactive behavior: outside CLI/gateway/ask
     # flows, we do not block on approvals and we skip external guard work.
-    if not is_cli and not is_gateway and not is_ask:
+    if not is_cli and not is_gateway and not is_ask and not worker_policy:
         # Cron sessions: respect cron_mode config
         if env_var_enabled("HERMES_CRON_SESSION"):
             if _get_cron_approval_mode() == "deny":
@@ -3369,11 +3494,11 @@ def check_all_command_guards(command: str, env_type: str,
         rule_id = findings[0].get("rule_id", "unknown") if findings else "unknown"
         tirith_key = f"tirith:{rule_id}"
         tirith_desc = _format_tirith_description(tirith_result)
-        if not is_approved(session_key, tirith_key):
+        if worker_policy or not is_approved(session_key, tirith_key):
             warnings.append((tirith_key, tirith_desc, True))
 
     if is_dangerous:
-        if not is_approved(session_key, pattern_key):
+        if worker_policy or not is_approved(session_key, pattern_key):
             warnings.append((pattern_key, description, False))
 
     # Nothing to warn about
@@ -3385,7 +3510,7 @@ def check_all_command_guards(command: str, env_type: str,
     # Inspired by OpenAI Codex's Smart Approvals guardian subagent
     # (openai/codex#13860).
     smart_denied_for_owner = False
-    if approval_mode == "smart":
+    if approval_mode == "smart" and not worker_policy:
         combined_desc_for_llm = "; ".join(desc for _, desc, _ in warnings)
         observer_payload = _prepare_smart_approval_observer(
             command=command,
@@ -3432,6 +3557,36 @@ def check_all_command_guards(command: str, env_type: str,
     # correctly persist the pattern key and downgrade the tirith key to
     # session — the UI was stricter than the persistence layer.
     has_permanent_capable = any(not is_t for _, _, is_t in warnings)
+
+    # A subagent in any parent runtime still owns a worker-local non-interactive
+    # callback. Resolve it here instead of prompting/queuing a human approval
+    # that the child cannot broaden or answer itself.
+    if worker_policy:
+        try:
+            choice = approval_callback(
+                command,
+                combined_desc,
+                pattern_key=primary_key,
+                pattern_keys=all_keys,
+            )
+        except Exception:
+            logger.exception("Subagent approval callback failed")
+            choice = "deny"
+        if choice in {"once", "session", "always"}:
+            return {
+                "approved": True,
+                "message": None,
+                "subagent_approved": True,
+                "description": combined_desc,
+            }
+        return {
+            "approved": False,
+            "message": (
+                f"BLOCKED: delegated worker policy denied a guarded command "
+                f"({combined_desc})."
+            ),
+            "description": combined_desc,
+        }
 
     # Gateway/async approval — block the agent thread until the user
     # responds with /approve or /deny, mirroring the CLI's synchronous

@@ -2406,14 +2406,26 @@ DEFAULT_CONFIG = {
         # raise deliberately, each level multiplies API cost.
         "max_spawn_depth": 1,        # depth (1 = flat [default], 2 = orchestrator→leaf, 3+ = deeper)
         "orchestrator_enabled": True,  # kill switch for role="orchestrator"
+        # Optional opaque mission capability grants. delegate_task exposes only
+        # configured names; roots/services/operations/controller schemas and
+        # budgets remain trusted config, are content-addressed, bound to the
+        # child goal, and inherited unchanged by nested workers.
+        # Supported allowed_operations: controller, service_reload. Controller
+        # files receive canonical path + SHA-256 drift checks and service
+        # reloads require configured absolute launchctl/systemctl executables
+        # with strict local argv grammars.
+        "default_capability_grant": "",
+        "capability_grants": {},
         # When a subagent hits a dangerous-command approval prompt, the parent's
         # prompt_toolkit TUI owns stdin — a thread-local input() call from the
         # subagent worker would deadlock the parent UI. To avoid the deadlock,
         # subagent threads ALWAYS resolve approvals non-interactively:
         #   false (default) → auto-deny with a logger.warning audit line (safe)
         #   true             → auto-approve "once" with a logger.warning audit line
-        # Flip to true only if you trust delegated work to run dangerous cmds
-        # without human review (cron pipelines, batch automation, etc.).
+        # Deprecated all-or-nothing compatibility knob. Prefer a named
+        # capability_grant so ordinary maintenance can proceed autonomously
+        # through typed controllers/service commands; trusted controllers keep
+        # their own domain boundaries.
         "subagent_auto_approve": False,
     },
 
