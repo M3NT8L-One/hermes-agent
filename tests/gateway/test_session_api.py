@@ -113,10 +113,11 @@ async def test_run_agent_binds_api_session_context_for_tool_env(adapter, monkeyp
     )
 
     assert result["session_id"] == "request-session"
+    # This test owns the session-context contract, not a snapshot of every
+    # usage field. New cache/context telemetry may extend the usage payload.
     assert usage["input_tokens"] == 0
     assert usage["output_tokens"] == 0
     assert usage["total_tokens"] == 0
-    assert "runtime" not in usage
     assert observed == {
         "task_id": "request-session",
         "context_session_id": "request-session",

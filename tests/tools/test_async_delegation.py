@@ -92,6 +92,36 @@ def test_dispatch_returns_immediately_without_blocking():
     gate.set()
 
 
+def test_reset_waits_for_inflight_worker_before_draining_completion_queue():
+    gate = threading.Event()
+    started = threading.Event()
+
+    def runner():
+        started.set()
+        gate.wait(timeout=2)
+        return {"status": "completed", "summary": "late result", "api_calls": 1}
+
+    ad.dispatch_async_delegation(
+        goal="reset-race", context=None, toolsets=None, role="leaf", model="m",
+        session_key="", runner=runner, max_async_children=3,
+    )
+    assert started.wait(timeout=1)
+
+    reset_thread = threading.Thread(target=ad._reset_for_tests)
+    reset_thread.start()
+    time.sleep(0.05)
+    assert reset_thread.is_alive(), "reset returned while a worker was still running"
+
+    gate.set()
+    reset_thread.join(timeout=2)
+    assert not reset_thread.is_alive()
+
+    evt = process_registry.completion_queue.get_nowait()
+    assert evt["goal"] == "reset-race"
+    time.sleep(0.05)
+    assert process_registry.completion_queue.empty()
+
+
 def test_async_executor_workers_are_daemon_threads():
     gate = threading.Event()
 

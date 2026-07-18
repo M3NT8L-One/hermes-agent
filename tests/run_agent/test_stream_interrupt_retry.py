@@ -183,7 +183,7 @@ class TestStreamInterruptBeforeRetry:
         surfacing the connection error that triggers the retry.
         """
         import httpx
-        import time
+        import threading
 
         from tests.run_agent.test_streaming import (
             _make_stream_chunk,
@@ -192,6 +192,7 @@ class TestStreamInterruptBeforeRetry:
 
         monkeypatch.setenv("HERMES_STREAM_STALE_TIMEOUT", "0.05")
         monkeypatch.setenv("HERMES_STREAM_RETRIES", "1")
+        stale_attempt_cancelled = threading.Event()
 
         class LateChunkAfterStaleStream:
             response = SimpleNamespace(headers={})
@@ -207,7 +208,7 @@ class TestStreamInterruptBeforeRetry:
                         )
                     ]
                 )
-                time.sleep(0.45)
+                assert stale_attempt_cancelled.wait(timeout=2.0)
                 yield _make_stream_chunk(content="old late ")
                 raise httpx.RemoteProtocolError("peer closed connection")
 
@@ -230,6 +231,7 @@ class TestStreamInterruptBeforeRetry:
 
         agent = _make_agent()
         agent._interrupt_requested = False
+        mock_replace.side_effect = lambda **_kwargs: stale_attempt_cancelled.set()
         deltas = []
         agent.stream_delta_callback = deltas.append
 

@@ -8,6 +8,7 @@ leaks show up as a time series in agent.log / gateway.log.
 from __future__ import annotations
 
 import logging
+import threading
 import time
 
 import pytest
@@ -87,11 +88,25 @@ def test_stop_without_start_is_noop():
     assert mm.is_running() is False
 
 
-def test_periodic_timer_fires(caplog):
+def test_periodic_timer_fires(caplog, monkeypatch):
     caplog.set_level(logging.INFO, logger="gateway.memory_monitor")
-    # Short interval so we can observe multiple ticks inside the test budget.
+    periodic_ready = threading.Event()
+    periodic_count = 0
+    original_log_memory_usage = mm.log_memory_usage
+
+    def _recording_log_memory_usage(prefix: str = "") -> None:
+        nonlocal periodic_count
+        original_log_memory_usage(prefix)
+        if not prefix:
+            periodic_count += 1
+            if periodic_count >= 3:
+                periodic_ready.set()
+
+    monkeypatch.setattr(mm, "log_memory_usage", _recording_log_memory_usage)
+    # Short interval plus an event-based deadline avoids assuming the monitor
+    # thread receives an exact number of scheduler slices in 450ms.
     mm.start_memory_monitoring(interval_seconds=0.1)
-    time.sleep(0.45)
+    assert periodic_ready.wait(timeout=3.0), "periodic monitor did not reach three ticks"
     mm.stop_memory_monitoring(timeout=1.0)
 
     periodic = [

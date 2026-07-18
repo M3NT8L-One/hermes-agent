@@ -211,7 +211,15 @@ class TestAcpExecAskGate:
         monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
         monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
 
-        from tools.approval import check_all_command_guards
+        import tools.approval as approval
+
+        # Full-suite collection can legitimately load the operator's real
+        # permanent allowlist before this test runs.  This regression test is
+        # about interactive routing, not user policy, so isolate it from that
+        # process-global state instead of depending on an empty live config.
+        monkeypatch.setattr(approval, "_permanent_approved", set())
+        monkeypatch.setattr(approval, "_session_approved", {})
+        check_all_command_guards = approval.check_all_command_guards
 
         called_with = []
 
@@ -257,11 +265,16 @@ class TestAcpExecAskGate:
         monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
         monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
 
-        from tools.approval import (
-            check_all_command_guards,
-            reset_hermes_interactive_context,
-            set_hermes_interactive_context,
-        )
+        import tools.approval as approval
+
+        # Other collected ACP modules load the operator's real permanent
+        # allowlist. This test verifies context-local interactive routing, not
+        # host policy, so isolate both approval caches before exercising it.
+        monkeypatch.setattr(approval, "_permanent_approved", set())
+        monkeypatch.setattr(approval, "_session_approved", {})
+        check_all_command_guards = approval.check_all_command_guards
+        reset_hermes_interactive_context = approval.reset_hermes_interactive_context
+        set_hermes_interactive_context = approval.set_hermes_interactive_context
 
         called_with = []
 
