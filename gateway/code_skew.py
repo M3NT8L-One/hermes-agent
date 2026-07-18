@@ -62,3 +62,22 @@ def detect_code_skew() -> tuple[str, str] | None:
     if current is None or current == _boot_fingerprint:
         return None
     return _short(_boot_fingerprint), _short(current)
+
+
+def source_revision_status() -> dict[str, str | bool | None]:
+    """Return the safe boot/disk revision summary for authenticated health.
+
+    Only compact Git revision labels are exposed.  When either fingerprint is
+    unavailable (for example, a non-Git wheel install), ``code_skew`` remains
+    unknown instead of claiming that the running process matches disk.
+    """
+    current = _fingerprint()
+    return {
+        "boot_revision": _short(_boot_fingerprint) if _boot_fingerprint else None,
+        "disk_revision": _short(current) if current else None,
+        "code_skew": (
+            _boot_fingerprint != current
+            if _boot_fingerprint is not None and current is not None
+            else None
+        ),
+    }

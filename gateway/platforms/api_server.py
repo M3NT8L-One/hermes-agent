@@ -397,6 +397,49 @@ def _auto_truncate_response_history(
                 break
 
     return [conversation_history[index] for index in sorted(kept_indices)]
+def _nonnegative_int(value: Any) -> int:
+    """Return a JSON-safe nonnegative integer for agent usage telemetry."""
+    if not isinstance(value, (bool, int, float, str)):
+        return 0
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def _agent_usage(agent: Any) -> Dict[str, int]:
+    """Build cumulative usage plus current context-window telemetry.
+
+    ``session_*`` counters are cumulative odometers. UI context fill must use
+    the compressor's latest prompt size, matching Telegram ``/status``.
+    """
+    compressor = getattr(agent, "context_compressor", None)
+    last_prompt = _nonnegative_int(
+        getattr(compressor, "last_prompt_tokens", 0) if compressor is not None else 0
+    )
+    context_length = _nonnegative_int(
+        getattr(compressor, "context_length", 0) if compressor is not None else 0
+    )
+    usage = {
+        "input_tokens": _nonnegative_int(getattr(agent, "session_input_tokens", 0)),
+        "prompt_tokens": _nonnegative_int(getattr(agent, "session_prompt_tokens", 0)),
+        "cache_read_tokens": _nonnegative_int(
+            getattr(agent, "session_cache_read_tokens", 0)
+        ),
+        "cache_write_tokens": _nonnegative_int(
+            getattr(agent, "session_cache_write_tokens", 0)
+        ),
+        "output_tokens": _nonnegative_int(getattr(agent, "session_completion_tokens", 0)),
+        "total_tokens": _nonnegative_int(getattr(agent, "session_total_tokens", 0)),
+        "last_prompt_tokens": last_prompt,
+        "context_length": context_length,
+    }
+    if context_length > 0:
+        usage["context_percent"] = max(
+            0, min(100, round((last_prompt / context_length) * 100))
+        )
+    return usage
+
 
 
 def _normalize_chat_content(
@@ -2649,6 +2692,7 @@ class APIServerAdapter(BasePlatformAdapter):
             parse_active_agents,
             read_runtime_status,
         )
+        from gateway.code_skew import source_revision_status
 
         runtime = read_runtime_status() or {}
         gw_state = runtime.get("gateway_state")
@@ -2688,6 +2732,7 @@ class APIServerAdapter(BasePlatformAdapter):
             # the state file may carry legacy epoch floats or hand-edited junk.
             "updated_at": normalize_updated_at(runtime.get("updated_at")),
             "pid": os.getpid(),
+            "source": source_revision_status(),
         })
 
     async def _handle_models(self, request: "web.Request") -> "web.Response":
@@ -3990,7 +4035,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 }
             ],
             "usage": {
-                "prompt_tokens": usage.get("input_tokens", 0),
+                "prompt_tokens": usage.get("prompt_tokens", usage.get("input_tokens", 0)),
                 "completion_tokens": usage.get("output_tokens", 0),
                 "total_tokens": usage.get("total_tokens", 0),
             },
@@ -4149,7 +4194,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "created": created, "model": model,
                 "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
                 "usage": {
-                    "prompt_tokens": usage.get("input_tokens", 0),
+                    "prompt_tokens": usage.get("prompt_tokens", usage.get("input_tokens", 0)),
                     "completion_tokens": usage.get("output_tokens", 0),
                     "total_tokens": usage.get("total_tokens", 0),
                 },
@@ -4356,7 +4401,7 @@ class APIServerAdapter(BasePlatformAdapter):
             incomplete_env = _envelope("incomplete")
             incomplete_env["output"] = incomplete_items
             incomplete_env["usage"] = {
-                "input_tokens": usage.get("input_tokens", 0),
+                "input_tokens": usage.get("prompt_tokens", usage.get("input_tokens", 0)),
                 "output_tokens": usage.get("output_tokens", 0),
                 "total_tokens": usage.get("total_tokens", 0),
             }
@@ -4699,7 +4744,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 failed_env["output"] = final_items
                 failed_env["error"] = {"message": _redact_api_error_text(agent_error), "type": "server_error"}
                 failed_env["usage"] = {
-                    "input_tokens": usage.get("input_tokens", 0),
+                    "input_tokens": usage.get("prompt_tokens", usage.get("input_tokens", 0)),
                     "output_tokens": usage.get("output_tokens", 0),
                     "total_tokens": usage.get("total_tokens", 0),
                 }
@@ -4723,7 +4768,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 completed_env = _envelope("completed")
                 completed_env["output"] = final_items
                 completed_env["usage"] = {
-                    "input_tokens": usage.get("input_tokens", 0),
+                    "input_tokens": usage.get("prompt_tokens", usage.get("input_tokens", 0)),
                     "output_tokens": usage.get("output_tokens", 0),
                     "total_tokens": usage.get("total_tokens", 0),
                 }
@@ -4795,7 +4840,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 failed_env["output"] = list(emitted_items)
                 failed_env["error"] = {"message": _redact_api_error_text(_exc, limit=500), "type": "server_error"}
                 failed_env["usage"] = {
-                    "input_tokens": usage.get("input_tokens", 0),
+                    "input_tokens": usage.get("prompt_tokens", usage.get("input_tokens", 0)),
                     "output_tokens": usage.get("output_tokens", 0),
                     "total_tokens": usage.get("total_tokens", 0),
                 }
@@ -5105,7 +5150,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "model": body.get("model", self._model_name),
             "output": output_items,
             "usage": {
-                "input_tokens": usage.get("input_tokens", 0),
+                "input_tokens": usage.get("prompt_tokens", usage.get("input_tokens", 0)),
                 "output_tokens": usage.get("output_tokens", 0),
                 "total_tokens": usage.get("total_tokens", 0),
             },
@@ -5785,11 +5830,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         conversation_history=conversation_history,
                         task_id=effective_task_id,
                     )
-                    usage = {
-                        "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
-                        "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
-                        "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
-                    }
+                    usage = _agent_usage(agent)
                     # Include the effective session ID in the result so callers
                     # (e.g. X-Hermes-Session-Id header) can track compression-
                     # triggered session rotations. (#16938)
@@ -6226,12 +6267,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                         clear_session_vars(session_tokens)
                                     except Exception:
                                         pass
-                        u = {
-                            "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
-                            "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
-                            "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
-                        }
-                        return r, u
+                        return r, _agent_usage(agent)
 
                 result, usage = await asyncio.get_running_loop().run_in_executor(None, _run_sync)
                 if run_id in self._stopping_run_ids:
@@ -6803,6 +6839,33 @@ class APIServerAdapter(BasePlatformAdapter):
             logger.error("[%s] Failed to start API server: %s", self.name, e)
             return False
 
+    def _close_owned_resources(self) -> None:
+        """Idempotently close SQLite resources owned by this adapter.
+
+        Kept synchronous so failed-connect paths and test fixtures can release
+        descriptors even when no event loop is available. Aiohttp resources
+        remain the responsibility of :meth:`disconnect`.
+        """
+        response_store = getattr(self, "_response_store", None)
+        self._response_store = None
+        if response_store is not None:
+            try:
+                response_store.close()
+            except Exception:
+                logger.debug(
+                    "Failed to close response store for %s", self.name, exc_info=True,
+                )
+
+        session_db = getattr(self, "_session_db", None)
+        self._session_db = None
+        if session_db is not None:
+            try:
+                session_db.close()
+            except Exception:
+                logger.debug(
+                    "Failed to close session store for %s", self.name, exc_info=True,
+                )
+
     async def disconnect(self) -> None:
         """Stop the aiohttp web server and release all owned resources.
 
@@ -6816,13 +6879,7 @@ class APIServerAdapter(BasePlatformAdapter):
         (OSError: [Errno 24] Too many open files, #37011).
         """
         self._mark_disconnected()
-        if self._response_store is not None:
-            try:
-                self._response_store.close()
-            except Exception:
-                logger.debug(
-                    "Failed to close response store for %s", self.name, exc_info=True,
-                )
+        self._close_owned_resources()
         if self._site:
             await self._site.stop()
             self._site = None

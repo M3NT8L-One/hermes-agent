@@ -2,6 +2,7 @@
 
 Pure display functions with no HermesCLI state dependency.
 """
+import hashlib
 import json
 import logging
 import os
@@ -115,6 +116,7 @@ def get_available_skills() -> Dict[str, List[str]]:
 
 # Cache update check results for 6 hours to avoid repeated git fetches
 _UPDATE_CHECK_CACHE_SECONDS = 6 * 3600
+_UPDATE_CHECK_CACHE_POLICY = 3
 
 # Sentinel returned when we know an update exists but can't count commits
 # (e.g. nix-built hermes — no local git history to count against).
@@ -154,6 +156,23 @@ def _is_official_ssh_remote(url: str | None) -> bool:
     return _is_ssh_remote(url) and _canonical_github_remote(url) == _OFFICIAL_REPO_CANONICAL
 
 
+def _official_update_remote(repo_dir: Path) -> tuple[str, str | None]:
+    """Select the canonical NousResearch remote, preferring fork ``upstream``.
+
+    Private forks normally keep their publish target as ``origin`` and the
+    official project as ``upstream``.  Update/banner truth must compare against
+    the latter instead of declaring a fork current merely because its private
+    origin is aligned.
+    """
+    origin_url = _git_stdout(["remote", "get-url", "origin"], cwd=repo_dir)
+    if _canonical_github_remote(origin_url) == _OFFICIAL_REPO_CANONICAL:
+        return "origin", origin_url
+    upstream_url = _git_stdout(["remote", "get-url", "upstream"], cwd=repo_dir)
+    if _canonical_github_remote(upstream_url) == _OFFICIAL_REPO_CANONICAL:
+        return "upstream", upstream_url
+    return "origin", origin_url
+
+
 def _git_stdout(args: list[str], *, cwd: Path, timeout: int = 5) -> Optional[str]:
     try:
         result = subprocess.run(
@@ -173,6 +192,34 @@ def _git_stdout(args: list[str], *, cwd: Path, timeout: int = 5) -> Optional[str
     if result.returncode != 0:
         return None
     return (result.stdout or "").strip()
+
+
+def _local_git_cache_identity(repo_dir: Path) -> dict[str, str | None] | None:
+    """Return the local/canonical Git identity that makes an update result valid.
+
+    A time-only cache can lie after a local merge or fetch: ``behind=13`` from
+    before the operation remains fresh even though both ``HEAD`` and the
+    canonical tracking ref moved.  Bind cached results to both revisions and
+    the selected official remote.  The remote URL is hashed so private fork
+    coordinates are never persisted in the cache.
+    """
+    remote, remote_url = _official_update_remote(repo_dir)
+    tracking_ref = f"{remote}/main"
+    head = _git_stdout(["rev-parse", "HEAD"], cwd=repo_dir)
+    if not head:
+        return None
+    tracking_tip = _git_stdout(["rev-parse", tracking_ref], cwd=repo_dir)
+    remote_fingerprint = hashlib.sha256(
+        (remote_url or "").encode("utf-8", errors="replace")
+    ).hexdigest()
+    return {
+        "mode": "git",
+        "head": head,
+        "remote": remote,
+        "tracking_ref": tracking_ref,
+        "tracking_tip": tracking_tip,
+        "remote_fingerprint": remote_fingerprint,
+    }
 
 
 def _check_via_rev(local_rev: str) -> Optional[int]:
@@ -198,9 +245,10 @@ def _check_via_rev(local_rev: str) -> Optional[int]:
 
 
 def _check_via_local_git(repo_dir: Path) -> Optional[int]:
-    """Count commits behind origin/main in a local checkout."""
-    origin_url = _git_stdout(["remote", "get-url", "origin"], cwd=repo_dir)
-    if _is_official_ssh_remote(origin_url):
+    """Count commits behind canonical main in a local checkout."""
+    remote, remote_url = _official_update_remote(repo_dir)
+    tracking_ref = f"{remote}/main"
+    if _is_official_ssh_remote(remote_url):
         head_rev = _git_stdout(["rev-parse", "HEAD"], cwd=repo_dir)
         checked = _check_via_rev(head_rev) if head_rev else None
         if checked == UPDATE_AVAILABLE_NO_COUNT:
@@ -219,7 +267,7 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
     is_shallow = shallow == "true"
 
     try:
-        fetch_args = ["git", "fetch", "origin"]
+        fetch_args = ["git", "fetch", remote]
         if is_shallow:
             fetch_args += ["--depth", "1"]
         fetch_args.append("--quiet")
@@ -232,13 +280,13 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
         pass  # Offline or timeout — use stale refs, that's fine
 
     if is_shallow:
-        # No history to count across the shallow boundary. `origin/main` may not
+        # No history to count across the shallow boundary. The tracking ref may not
         # be a tracking ref in a `clone --depth 1`, so prefer FETCH_HEAD (just
         # updated by the fetch above) and fall back to origin/main.
         head_rev = _git_stdout(["rev-parse", "HEAD"], cwd=repo_dir)
         target_rev = (
             _git_stdout(["rev-parse", "FETCH_HEAD"], cwd=repo_dir)
-            or _git_stdout(["rev-parse", "origin/main"], cwd=repo_dir)
+            or _git_stdout(["rev-parse", tracking_ref], cwd=repo_dir)
         )
         if not head_rev or not target_rev:
             return None
@@ -246,7 +294,7 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
 
     try:
         result = subprocess.run(
-            ["git", "rev-list", "--count", "HEAD..origin/main"],
+            ["git", "rev-list", "--count", f"HEAD..{tracking_ref}"],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
             timeout=5,
             cwd=str(repo_dir),
@@ -272,6 +320,8 @@ def check_for_updates() -> Optional[int]:
     hermes_home = get_hermes_home()
     cache_file = hermes_home / ".update_check"
     embedded_rev = os.environ.get("HERMES_REVISION") or None
+    repo_dir: Path | None = None
+    cache_identity: dict[str, str | None] | None
 
     # Docker images have no working tree to count commits against — the
     # published image excludes `.git` (see .dockerignore) and sets no
@@ -287,8 +337,26 @@ def check_for_updates() -> Optional[int]:
     except Exception:
         pass
 
-    # Read cache — invalidate if the embedded rev OR installed version has
-    # changed since the last check.
+    if embedded_rev:
+        cache_identity = {"mode": "embedded", "revision": embedded_rev}
+    else:
+        # Prefer the running code's location over the profile-scoped path.
+        # $HERMES_HOME/hermes-agent/ may be a stale copy from --clone-all;
+        # Path(__file__) always resolves to the actual installed checkout.
+        repo_dir = Path(__file__).parent.parent.resolve()
+        if not (repo_dir / ".git").exists():
+            repo_dir = hermes_home / "hermes-agent"
+        if (repo_dir / ".git").exists():
+            cache_identity = _local_git_cache_identity(repo_dir)
+        else:
+            repo_dir = None
+            cache_identity = {"mode": "package"}
+
+    # Read cache — invalidate if the source identity or installed version has
+    # changed since the last check. The version guard matters for pip installs:
+    # `check_via_pypi()` compares against VERSION, so a `pip install --upgrade`
+    # changes VERSION but leaves rev unchanged (both None), and without this
+    # the stale "behind" count would survive the upgrade for up to 6h. See #34491.
     now = time.time()
     try:
         if cache_file.exists():
@@ -297,6 +365,9 @@ def check_for_updates() -> Optional[int]:
                 now - cached.get("ts", 0) < _UPDATE_CHECK_CACHE_SECONDS
                 and cached.get("rev") == embedded_rev
                 and cached.get("ver") == VERSION
+                and cached.get("policy") == _UPDATE_CHECK_CACHE_POLICY
+                and cache_identity is not None
+                and cached.get("identity") == cache_identity
             ):
                 return cached.get("behind")
     except Exception:
@@ -304,24 +375,24 @@ def check_for_updates() -> Optional[int]:
 
     if embedded_rev:
         behind = _check_via_rev(embedded_rev)
+    elif repo_dir is None:
+        behind = check_via_pypi()
     else:
-        # Prefer the running code's location over the profile-scoped path.
-        # $HERMES_HOME/hermes-agent/ may be a stale copy from --clone-all;
-        # Path(__file__) always resolves to the actual installed checkout.
-        repo_dir = Path(__file__).parent.parent.resolve()
-        if not (repo_dir / ".git").exists():
-            repo_dir = hermes_home / "hermes-agent"
-        if not (repo_dir / ".git").exists():
-            # No git checkout and no embedded revision — can't determine
-            # update status. This is the Docker path (already short-circuited
-            # above) or an unsupported install without a source tree.
-            behind = None
-        else:
-            behind = _check_via_local_git(repo_dir)
+        behind = _check_via_local_git(repo_dir)
+        # The check fetches the canonical remote and may move its tracking ref;
+        # persist the post-fetch identity so the next invocation can reuse it.
+        cache_identity = _local_git_cache_identity(repo_dir)
 
     try:
         cache_file.write_text(
-            json.dumps({"ts": now, "behind": behind, "rev": embedded_rev, "ver": VERSION})
+            json.dumps({
+                "ts": now,
+                "behind": behind,
+                "rev": embedded_rev,
+                "ver": VERSION,
+                "policy": _UPDATE_CHECK_CACHE_POLICY,
+                "identity": cache_identity,
+            })
         )
     except Exception:
         pass
@@ -388,7 +459,12 @@ def get_git_banner_state(repo_dir: Optional[Path] = None) -> Optional[dict]:
             pass
         return None
 
-    upstream = _git_short_hash(repo_dir, "origin/main")
+    remote, _ = _official_update_remote(repo_dir)
+    tracking_ref = f"{remote}/main"
+    upstream = _git_short_hash(repo_dir, tracking_ref)
+    if not upstream and tracking_ref != "origin/main":
+        tracking_ref = "origin/main"
+        upstream = _git_short_hash(repo_dir, tracking_ref)
     local = _git_short_hash(repo_dir, "HEAD")
     if not upstream or not local:
         # Live-git lookup failed (e.g. shallow clone without origin/main).
@@ -405,7 +481,7 @@ def get_git_banner_state(repo_dir: Optional[Path] = None) -> Optional[dict]:
     ahead = 0
     try:
         result = subprocess.run(
-            ["git", "rev-list", "--count", "origin/main..HEAD"],
+            ["git", "rev-list", "--count", f"{tracking_ref}..HEAD"],
             capture_output=True,
             text=True,
             encoding="utf-8",

@@ -138,7 +138,11 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
 
 @pytest.fixture
 def adapter():
-    return _make_adapter()
+    instance = _make_adapter()
+    try:
+        yield instance
+    finally:
+        instance._close_owned_resources()
 
 
 class TestChatCompletionsMultimodalHTTP:

@@ -20,6 +20,7 @@ import sys
 import time
 import types
 import uuid
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -695,12 +696,20 @@ class _FakeGoogleChatAdapter:
 
 @pytest.fixture
 def adapter():
-    return _make_adapter()
+    instance = _make_adapter()
+    try:
+        yield instance
+    finally:
+        instance._close_owned_resources()
 
 
 @pytest.fixture
 def auth_adapter():
-    return _make_adapter(api_key="sk-secret")
+    instance = _make_adapter(api_key="sk-secret")
+    try:
+        yield instance
+    finally:
+        instance._close_owned_resources()
 
 
 # ---------------------------------------------------------------------------
@@ -709,6 +718,20 @@ def auth_adapter():
 
 
 class TestAgentExecution:
+    def test_close_owned_resources_is_idempotent(self, adapter):
+        response_store = adapter._response_store
+        session_db = MagicMock()
+        adapter._session_db = session_db
+
+        with patch.object(response_store, "close") as close_response_store:
+            adapter._close_owned_resources()
+            adapter._close_owned_resources()
+
+        close_response_store.assert_called_once_with()
+        session_db.close.assert_called_once_with()
+        assert adapter._response_store is None
+        assert adapter._session_db is None
+
     @pytest.mark.asyncio
     async def test_run_agent_uses_session_id_as_task_id(self, adapter):
         mock_agent = MagicMock()
@@ -734,7 +757,16 @@ class TestAgentExecution:
         # here doesn't set an explicit session_id string so the guard skips
         # the annotation — header will fall back to the provided session_id.
         assert result["final_response"] == "ok"
-        assert usage == {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3}
+        assert usage == {
+            "input_tokens": 0,
+            "prompt_tokens": 1,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+            "output_tokens": 2,
+            "total_tokens": 3,
+            "last_prompt_tokens": 0,
+            "context_length": 0,
+        }
         create_kwargs = mock_create_agent.call_args.kwargs
         assert create_kwargs["requested_model"] == "MiniMax-M3"
         assert create_kwargs["requested_provider"] == "minimax"
@@ -988,7 +1020,17 @@ class TestHealthDetailedEndpoint:
             "active_agents": 2,
             "exit_reason": None,
             "updated_at": "2026-04-14T00:00:00Z",
-        }), patch("gateway.run._resolve_gateway_model", return_value="test/model"):
+        }), patch(
+            "gateway.code_skew.source_revision_status",
+            return_value={
+                "boot_revision": "abc1234567",
+                "disk_revision": "abc1234567",
+                "code_skew": False,
+            },
+        ), patch("gateway.run._resolve_gateway_model", return_value="test/model"), patch(
+            "gateway.readiness.shutil.disk_usage",
+            return_value=SimpleNamespace(total=100, used=1, free=99),
+        ):
             async with TestClient(TestServer(app)) as cli:
                 resp = await cli.get("/health/detailed")
                 assert resp.status == 200
@@ -1004,6 +1046,11 @@ class TestHealthDetailedEndpoint:
                 assert data["gateway_drainable"] is True
                 assert isinstance(data["pid"], int)
                 assert "updated_at" in data
+                assert data["source"] == {
+                    "boot_revision": "abc1234567",
+                    "disk_revision": "abc1234567",
+                    "code_skew": False,
+                }
 
     @pytest.mark.asyncio
     async def test_health_detailed_no_runtime_status(self, adapter):

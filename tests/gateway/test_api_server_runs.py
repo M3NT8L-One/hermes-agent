@@ -106,12 +106,20 @@ def _make_slow_agent(**kwargs):
 
 @pytest.fixture
 def adapter():
-    return _make_adapter()
+    instance = _make_adapter()
+    try:
+        yield instance
+    finally:
+        instance._close_owned_resources()
 
 
 @pytest.fixture
 def auth_adapter():
-    return _make_adapter(api_key="sk-secret")
+    instance = _make_adapter(api_key="sk-secret")
+    try:
+        yield instance
+    finally:
+        instance._close_owned_resources()
 
 
 # ---------------------------------------------------------------------------
@@ -357,6 +365,47 @@ class TestRunStatus:
                 assert status["output"] == "done"
                 assert status["usage"]["total_tokens"] == 6
                 assert status["last_event"] == "run.completed"
+
+    @pytest.mark.asyncio
+    async def test_completed_run_separates_cumulative_usage_from_window_fill(self, adapter):
+        """RockyApp context % uses the latest prompt, not session odometers."""
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {"final_response": "done"}
+                mock_agent.session_input_tokens = 30_000
+                mock_agent.session_cache_read_tokens = 50_000
+                mock_agent.session_cache_write_tokens = 10_000
+                mock_agent.session_prompt_tokens = 90_000
+                mock_agent.session_completion_tokens = 10_000
+                mock_agent.session_total_tokens = 100_000
+                mock_agent.context_compressor.last_prompt_tokens = 18_600
+                mock_agent.context_compressor.context_length = 372_000
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post("/v1/runs", json={"input": "hello"})
+                run_id = (await resp.json())["run_id"]
+                status = {}
+
+                for _ in range(20):
+                    status_resp = await cli.get(f"/v1/runs/{run_id}")
+                    status = await status_resp.json()
+                    if status["status"] == "completed":
+                        break
+                    await asyncio.sleep(0.05)
+
+                assert status["usage"] == {
+                    "input_tokens": 30_000,
+                    "prompt_tokens": 90_000,
+                    "cache_read_tokens": 50_000,
+                    "cache_write_tokens": 10_000,
+                    "output_tokens": 10_000,
+                    "total_tokens": 100_000,
+                    "last_prompt_tokens": 18_600,
+                    "context_length": 372_000,
+                    "context_percent": 5,
+                }
 
     @pytest.mark.asyncio
     async def test_status_reflects_explicit_session_id(self, adapter):
