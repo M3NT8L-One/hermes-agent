@@ -9,7 +9,8 @@ Tool dispatch inside such a thread therefore silently loses:
     ``gateway.session_context``) — so gateway sessions fall into
     ``check_dangerous_command``'s non-interactive auto-approve branch and
     dangerous commands run without prompting (#33057, #30882);
-  * the thread-local CLI approval/sudo callbacks (``tools.terminal_tool``) —
+  * the thread-local CLI approval/sudo callbacks and delegated capability
+    authorizer (``tools.terminal_tool``) —
     so ``prompt_dangerous_approval`` cannot reach the user
     (GHSA-qg5c-hvr5-hjgr, #15216).
 
@@ -26,9 +27,9 @@ returned callable as the worker's target::
     # or
     executor.submit(propagate_context_to_thread(worker_fn), *args)
 
-Approval/sudo callbacks are installed for the worker's lifetime and **always
-cleared on exit**, so a recycled thread never holds a stale reference to a
-disposed CLI instance.
+Approval/sudo/capability callbacks are installed for the worker's lifetime and
+**always cleared on exit**, so a recycled thread never holds a stale reference
+to a disposed CLI instance or delegated mission.
 """
 
 from __future__ import annotations
@@ -49,21 +50,25 @@ def _callback_api():
     """
     from tools.terminal_tool import (
         _get_approval_callback,
+        _get_capability_authorizer,
         _get_sudo_password_callback,
         set_approval_callback,
+        set_capability_authorizer,
         set_sudo_password_callback,
     )
     return (
         _get_approval_callback,
         _get_sudo_password_callback,
+        _get_capability_authorizer,
         set_approval_callback,
         set_sudo_password_callback,
+        set_capability_authorizer,
     )
 
 
 def propagate_context_to_thread(target: Callable) -> Callable:
     """Wrap *target* for execution on a worker thread with the *current*
-    thread's ContextVars and approval/sudo callbacks propagated.
+    thread's ContextVars and approval/sudo/capability callbacks propagated.
 
     Call this on the parent thread; pass the returned callable as the
     thread/executor target.  The returned callable forwards its positional
@@ -76,42 +81,60 @@ def propagate_context_to_thread(target: Callable) -> Callable:
     absent.
     """
     ctx = contextvars.copy_context()
-    parent_approval_cb = parent_sudo_cb = None
+    parent_approval_cb = parent_sudo_cb = parent_capability_cb = None
     setters = None
     try:
-        get_approval, get_sudo, set_approval, set_sudo = _callback_api()
+        (
+            get_approval,
+            get_sudo,
+            get_capability,
+            set_approval,
+            set_sudo,
+            set_capability,
+        ) = _callback_api()
         parent_approval_cb = get_approval()
         parent_sudo_cb = get_sudo()
-        setters = (set_approval, set_sudo)
+        parent_capability_cb = get_capability()
+        setters = (set_approval, set_sudo, set_capability)
     except Exception:
-        logger.debug("Could not capture parent approval/sudo callbacks", exc_info=True)
+        logger.debug(
+            "Could not capture parent approval/sudo/capability callbacks",
+            exc_info=True,
+        )
 
     def _runner(*args, **kwargs):
         def _inner():
             if setters is not None:
-                set_approval, set_sudo = setters
+                set_approval, set_sudo, set_capability = setters
                 try:
                     if parent_approval_cb is not None:
                         set_approval(parent_approval_cb)
                     if parent_sudo_cb is not None:
                         set_sudo(parent_sudo_cb)
+                    if parent_capability_cb is not None:
+                        set_capability(parent_capability_cb)
                 except Exception:
                     logger.debug(
-                        "Failed to install propagated approval/sudo callbacks; "
+                        "Failed to install propagated approval/sudo/capability callbacks; "
                         "dangerous-command approval will fail closed",
                         exc_info=True,
                     )
+                    if parent_capability_cb is not None:
+                        raise RuntimeError(
+                            "Failed to propagate delegated capability policy"
+                        )
             try:
                 return target(*args, **kwargs)
             finally:
                 if setters is not None:
-                    set_approval, set_sudo = setters
+                    set_approval, set_sudo, set_capability = setters
                     try:
                         set_approval(None)
                         set_sudo(None)
+                        set_capability(None)
                     except Exception:
                         logger.debug(
-                            "Failed to clear propagated approval/sudo callbacks",
+                            "Failed to clear propagated approval/sudo/capability callbacks",
                             exc_info=True,
                         )
 

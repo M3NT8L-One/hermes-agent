@@ -3,8 +3,8 @@
 Covers the canonical fix for issues #4146, #27303, #30882, #33057:
 
   1. tools.thread_context.propagate_context_to_thread — propagates the agent
-     turn's ContextVars AND thread-local approval/sudo callbacks into worker
-     threads, and clears the callbacks on teardown.
+     turn's ContextVars AND thread-local approval/sudo/capability callbacks
+     into worker threads, and clears the callbacks on teardown.
   2. Both execute_code RPC threads are wrapped with that helper (source guard).
   3. tools.approval.check_execute_code_guard — the entry-point guard decision
      matrix (isolated backends, yolo/off, cron-deny, headless-local,
@@ -30,7 +30,7 @@ from tools.thread_context import propagate_context_to_thread
 # 1. Context + callback propagation helper
 # ---------------------------------------------------------------------------
 
-def test_helper_propagates_contextvar_and_approval_callback():
+def test_helper_propagates_contextvar_and_terminal_callbacks():
     from tools import terminal_tool as TT
 
     probe: contextvars.ContextVar[str] = contextvars.ContextVar(
@@ -38,13 +38,16 @@ def test_helper_propagates_contextvar_and_approval_callback():
     )
     probe.set("parent-value")
     sentinel = object()
+    capability = object()
     TT.set_approval_callback(sentinel)
+    TT.set_capability_authorizer(capability)
     try:
         seen: dict = {}
 
         def worker():
             seen["probe"] = probe.get()
             seen["cb"] = TT._get_approval_callback()
+            seen["capability"] = TT._get_capability_authorizer()
 
         t = threading.Thread(target=propagate_context_to_thread(worker))
         t.start()
@@ -52,8 +55,10 @@ def test_helper_propagates_contextvar_and_approval_callback():
 
         assert seen["probe"] == "parent-value"  # ContextVar propagated
         assert seen["cb"] is sentinel            # thread-local callback propagated
+        assert seen["capability"] is capability
     finally:
         TT.set_approval_callback(None)
+        TT.set_capability_authorizer(None)
 
 
 def test_helper_clears_callbacks_on_teardown():
@@ -62,15 +67,19 @@ def test_helper_clears_callbacks_on_teardown():
     from tools import terminal_tool as TT
 
     sentinel = object()
+    capability = object()
     TT.set_approval_callback(sentinel)
+    TT.set_capability_authorizer(capability)
     try:
         seen: dict = {}
 
         def first():
             seen["during"] = TT._get_approval_callback()
+            seen["capability_during"] = TT._get_capability_authorizer()
 
         def second():  # NOT wrapped — runs on the same recycled worker thread
             seen["after"] = TT._get_approval_callback()
+            seen["capability_after"] = TT._get_capability_authorizer()
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
             ex.submit(propagate_context_to_thread(first)).result(timeout=5)
@@ -78,8 +87,47 @@ def test_helper_clears_callbacks_on_teardown():
 
         assert seen["during"] is sentinel  # installed for the wrapped target
         assert seen["after"] is None       # cleared on teardown
+        assert seen["capability_during"] is capability
+        assert seen["capability_after"] is None
     finally:
         TT.set_approval_callback(None)
+        TT.set_capability_authorizer(None)
+
+
+def test_parallel_terminal_guard_and_process_stdin_keep_capability_policy():
+    """The same TLS policy must survive the executor hop for both tools."""
+    import json
+    from tools import process_registry as PR
+    from tools import terminal_tool as TT
+
+    def capability(command, *, effective_cwd=None, env_type=None):
+        return {
+            "matched": True,
+            "allowed": False,
+            "reason": "parallel_capability_test",
+        }
+
+    TT.set_capability_authorizer(capability)
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            terminal_result = executor.submit(
+                propagate_context_to_thread(TT._check_all_guards),
+                "echo guarded",
+                "local",
+                False,
+                "/tmp",
+            ).result(timeout=5)
+            process_result = executor.submit(
+                propagate_context_to_thread(PR._handle_process),
+                {"action": "submit", "session_id": "missing"},
+                task_id="child-task",
+            ).result(timeout=5)
+
+        assert terminal_result["approved"] is False
+        assert terminal_result["description"] == "parallel_capability_test"
+        assert "scoped delegated mission" in json.loads(process_result)["error"]
+    finally:
+        TT.set_capability_authorizer(None)
 
 
 def test_both_rpc_threads_use_propagation_helper():

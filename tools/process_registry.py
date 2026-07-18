@@ -2392,6 +2392,28 @@ def _handle_process(args, **kw):
     elif action in {"poll", "log", "wait", "kill", "write", "submit", "close"}:
         if not session_id:
             return tool_error(f"session_id is required for {action}")
+        scoped_capability = None
+        if action in {"kill", "write", "submit", "close"}:
+            # A capability-granted child may only execute fully authorized,
+            # non-interactive argv. Feeding an already-running PTY would evade
+            # the terminal guard because the new bytes are not a new command.
+            from tools.terminal_tool import _get_capability_authorizer
+
+            scoped_capability = _get_capability_authorizer()
+        if scoped_capability is not None:
+            target_session = process_registry.get(session_id)
+            if target_session is not None and (
+                not task_id or target_session.task_id != task_id
+            ):
+                return tool_error(
+                    "Scoped delegated missions may mutate only background "
+                    "processes created by the same child task."
+                )
+            if action in {"write", "submit"}:
+                return tool_error(
+                    "Process stdin write/submit is unavailable during a scoped "
+                    "delegated mission; use a non-interactive granted controller."
+                )
         if action == "poll":
             return json.dumps(_redact_process_result(process_registry.poll(session_id)), ensure_ascii=False)
         elif action == "log":
