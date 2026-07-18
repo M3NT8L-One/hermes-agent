@@ -296,6 +296,23 @@ delegation:
   provider: "openrouter"                             # Optional built-in provider
   api_mode: anthropic_messages                       # optional; auto-detected from base_url for anthropic_messages endpoints
 
+# Optional tiered, allowlisted worker routes. The model sees only the names
+# "fast" and "strong" — never raw provider/model arguments.
+delegation:
+  provider: xai-oauth
+  model: grok-composer-2.5-fast
+  reasoning_effort: none
+  default_route_class: fast
+  route_classes:
+    fast:
+      provider: xai-oauth
+      model: grok-composer-2.5-fast
+      reasoning_effort: none
+    strong:
+      provider: xai-oauth
+      model: grok-4.5
+      reasoning_effort: high
+
 # Or use a direct custom endpoint instead of provider:
 delegation:
   model: "qwen2.5-coder"
@@ -305,6 +322,8 @@ delegation:
 ```
 
 When `base_url` points at an Anthropic-compatible endpoint — for example a path ending in `/anthropic`, an Azure Foundry Claude route, or a MiniMax `/anthropic` proxy — `api_mode` is auto-detected as `anthropic_messages` so the subagent uses the right wire format without you setting anything. Set `api_mode` explicitly when the auto-detection guess is wrong (rare).
+
+When route classes are configured, omit `route_class` to use `default_route_class`, or pass an allowed class at the top level or on an individual batch task. An unknown class fails the entire delegation before any child starts. Configs without `route_classes` retain the original single-route behavior, and the selector is omitted from the model-facing tool schema.
 
 :::tip
 The agent handles delegation automatically based on the task complexity. You don't need to explicitly ask it to delegate — it will do so when it makes sense.

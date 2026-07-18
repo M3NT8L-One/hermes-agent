@@ -2354,6 +2354,11 @@ DEFAULT_CONFIG = {
     "delegation": {
         "model": "",       # e.g. "google/gemini-3-flash-preview" (empty = inherit parent model)
         "provider": "",    # e.g. "openrouter" (empty = inherit parent provider + credentials)
+        # Optional opaque per-call routing classes.  The delegate_task tool
+        # exposes only configured class names, never arbitrary provider/model
+        # input.  Empty values preserve the legacy single-route behavior.
+        "default_route_class": "",
+        "route_classes": {},
         "base_url": "",    # direct OpenAI-compatible endpoint for subagents
         "api_key": "",     # API key for delegation.base_url (falls back to OPENAI_API_KEY)
         "api_mode": "",    # wire protocol for delegation.base_url: "chat_completions",

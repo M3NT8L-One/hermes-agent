@@ -34,6 +34,7 @@ from tools.delegate_tool import (
     _strip_blocked_tools,
     _resolve_child_credential_pool,
     _resolve_delegation_credentials,
+    _select_delegation_route,
     _inherit_parent_base_url,
 )
 
@@ -61,6 +62,29 @@ def _make_mock_parent(depth=0):
     return parent
 
 
+def _make_route_class_config():
+    """Team H-style opaque delegation routes used by focused tests."""
+    return {
+        "provider": "xai-oauth",
+        "model": "grok-composer-2.5-fast",
+        "reasoning_effort": "none",
+        "default_route_class": "fast",
+        "route_classes": {
+            "fast": {
+                "provider": "xai-oauth",
+                "model": "grok-composer-2.5-fast",
+                "reasoning_effort": "none",
+            },
+            "strong": {
+                "provider": "xai-oauth",
+                "model": "grok-4.5",
+                "reasoning_effort": "high",
+            },
+        },
+        "max_iterations": 50,
+    }
+
+
 class TestDelegateRequirements(unittest.TestCase):
     def test_always_available(self):
         self.assertTrue(check_delegate_requirements())
@@ -86,6 +110,12 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertNotIn("acp_args", props)
         self.assertNotIn("acp_command", props["tasks"]["items"]["properties"])
         self.assertNotIn("acp_args", props["tasks"]["items"]["properties"])
+        # Per-call routing is intentionally limited to configured opaque class
+        # names.  Raw provider/model selection is never a model-facing field.
+        self.assertNotIn("provider", props)
+        self.assertNotIn("model", props)
+        self.assertNotIn("provider", props["tasks"]["items"]["properties"])
+        self.assertNotIn("model", props["tasks"]["items"]["properties"])
         self.assertNotIn("maxItems", props["tasks"])  # removed — limit is now runtime-configurable
 
     def test_schema_description_advertises_runtime_limits(self):
@@ -1173,6 +1203,197 @@ class TestBlockedTools(unittest.TestCase):
         self.assertEqual(_get_max_spawn_depth(), 1)       # default: flat
         self.assertTrue(_get_orchestrator_enabled())      # default
         self.assertEqual(_MIN_SPAWN_DEPTH, 1)
+
+
+class TestDelegationRouteClasses(unittest.TestCase):
+    """Opaque allowlisted route selection and legacy compatibility."""
+
+    def test_unknown_route_class_is_rejected_with_allowlist(self):
+        with self.assertRaises(ValueError) as ctx:
+            _select_delegation_route(_make_route_class_config(), "turbo")
+
+        message = str(ctx.exception)
+        self.assertIn("Unknown delegation route_class", message)
+        self.assertIn("fast", message)
+        self.assertIn("strong", message)
+
+    def test_default_route_class_selects_fast(self):
+        selected, route = _select_delegation_route(_make_route_class_config())
+
+        self.assertEqual(selected, "fast")
+        self.assertEqual(route["provider"], "xai-oauth")
+        self.assertEqual(route["model"], "grok-composer-2.5-fast")
+        self.assertEqual(route["reasoning_effort"], "none")
+        self.assertNotIn("route_classes", route)
+
+    @patch("run_agent.AIAgent")
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    @patch("tools.delegate_tool._load_config")
+    def test_default_class_reaches_child_and_result_metadata(
+        self,
+        mock_cfg,
+        mock_resolve,
+        MockAgent,
+    ):
+        mock_cfg.return_value = _make_route_class_config()
+        mock_resolve.return_value = {
+            "model": "grok-composer-2.5-fast",
+            "provider": "xai-oauth",
+            "base_url": "https://api.x.ai/v1",
+            "api_key": "oauth-token",
+            "api_mode": "codex_responses",
+            "request_overrides": {},
+            "max_output_tokens": None,
+            "command": None,
+            "args": [],
+        }
+        child = MagicMock()
+        child.model = "grok-composer-2.5-fast"
+        child.session_prompt_tokens = 1
+        child.session_completion_tokens = 1
+        child.run_conversation.return_value = {
+            "final_response": "done",
+            "completed": True,
+            "api_calls": 1,
+        }
+        MockAgent.return_value = child
+
+        result = json.loads(
+            delegate_task(goal="routine work", parent_agent=_make_mock_parent())
+        )
+
+        effective_route = mock_resolve.call_args.args[0]
+        self.assertEqual(effective_route["model"], "grok-composer-2.5-fast")
+        self.assertEqual(effective_route["reasoning_effort"], "none")
+        self.assertEqual(result["results"][0]["route_class"], "fast")
+        self.assertEqual(result["results"][0]["model"], "grok-composer-2.5-fast")
+        self.assertEqual(
+            MockAgent.call_args.kwargs["reasoning_config"],
+            {"enabled": False},
+        )
+
+    def test_explicit_strong_route_class_selects_grok_45_high(self):
+        selected, route = _select_delegation_route(
+            _make_route_class_config(),
+            "strong",
+        )
+
+        self.assertEqual(selected, "strong")
+        self.assertEqual(route["provider"], "xai-oauth")
+        self.assertEqual(route["model"], "grok-4.5")
+        self.assertEqual(route["reasoning_effort"], "high")
+
+    @patch("run_agent.AIAgent")
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    @patch("tools.delegate_tool._load_config")
+    def test_explicit_strong_class_reaches_child_and_result_metadata(
+        self,
+        mock_cfg,
+        mock_resolve,
+        MockAgent,
+    ):
+        mock_cfg.return_value = _make_route_class_config()
+        mock_resolve.return_value = {
+            "model": "grok-4.5",
+            "provider": "xai-oauth",
+            "base_url": "https://api.x.ai/v1",
+            "api_key": "oauth-token",
+            "api_mode": "codex_responses",
+            "request_overrides": {},
+            "max_output_tokens": None,
+            "command": None,
+            "args": [],
+        }
+        child = MagicMock()
+        child.model = "grok-4.5"
+        child.session_prompt_tokens = 1
+        child.session_completion_tokens = 1
+        child.run_conversation.return_value = {
+            "final_response": "done",
+            "completed": True,
+            "api_calls": 1,
+        }
+        MockAgent.return_value = child
+
+        result = json.loads(
+            delegate_task(
+                goal="hard work",
+                route_class="strong",
+                parent_agent=_make_mock_parent(),
+            )
+        )
+
+        effective_route = mock_resolve.call_args.args[0]
+        self.assertEqual(effective_route["model"], "grok-4.5")
+        self.assertEqual(effective_route["reasoning_effort"], "high")
+        self.assertEqual(result["results"][0]["route_class"], "strong")
+        self.assertEqual(result["results"][0]["model"], "grok-4.5")
+        self.assertEqual(
+            MockAgent.call_args.kwargs["reasoning_config"],
+            {"enabled": True, "effort": "high"},
+        )
+
+    def test_old_single_route_config_is_unchanged(self):
+        legacy = {
+            "provider": "openrouter",
+            "model": "anthropic/claude-sonnet-4",
+            "max_iterations": 25,
+        }
+
+        selected, route = _select_delegation_route(legacy)
+
+        self.assertIsNone(selected)
+        self.assertEqual(route, legacy)
+
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    @patch("tools.delegate_tool._load_config")
+    def test_delegate_rejects_unknown_class_before_credentials(
+        self,
+        mock_cfg,
+        mock_resolve,
+    ):
+        mock_cfg.return_value = _make_route_class_config()
+
+        result = json.loads(
+            delegate_task(
+                goal="Do work",
+                route_class="turbo",
+                parent_agent=_make_mock_parent(),
+            )
+        )
+
+        self.assertIn("error", result)
+        self.assertIn("Unknown delegation route_class", result["error"])
+        mock_resolve.assert_not_called()
+
+    @patch("tools.delegate_tool._load_config")
+    def test_dynamic_schema_exposes_only_configured_classes(self, mock_cfg):
+        from tools.delegate_tool import _build_dynamic_schema_overrides
+
+        mock_cfg.return_value = _make_route_class_config()
+        properties = _build_dynamic_schema_overrides()["parameters"]["properties"]
+
+        self.assertEqual(properties["route_class"]["enum"], ["fast", "strong"])
+        task_properties = properties["tasks"]["items"]["properties"]
+        self.assertEqual(task_properties["route_class"]["enum"], ["fast", "strong"])
+        self.assertNotIn("provider", properties)
+        self.assertNotIn("model", properties)
+
+    @patch("tools.delegate_tool._load_config")
+    def test_dynamic_schema_hides_selector_for_old_configs(self, mock_cfg):
+        from tools.delegate_tool import _build_dynamic_schema_overrides
+
+        mock_cfg.return_value = {
+            "provider": "openrouter",
+            "model": "anthropic/claude-sonnet-4",
+        }
+        properties = _build_dynamic_schema_overrides()["parameters"]["properties"]
+
+        self.assertNotIn("route_class", properties)
+        self.assertNotIn(
+            "route_class",
+            properties["tasks"]["items"]["properties"],
+        )
 
 
 class TestDelegationCredentialResolution(unittest.TestCase):
@@ -2384,6 +2605,54 @@ class TestDelegationReasoningEffort(unittest.TestCase):
         call_kwargs = MockAgent.call_args[1]
         self.assertEqual(call_kwargs["reasoning_config"], {"enabled": True, "effort": "medium"})
 
+    @patch("run_agent.AIAgent")
+    def test_fast_route_disables_reasoning(self, MockAgent):
+        MockAgent.return_value = MagicMock()
+        parent = _make_mock_parent()
+        parent.reasoning_config = {"enabled": True, "effort": "high"}
+        _, route = _select_delegation_route(_make_route_class_config(), "fast")
+
+        _build_child_agent(
+            task_index=0,
+            goal="routine worker",
+            context=None,
+            toolsets=None,
+            model="grok-composer-2.5-fast",
+            max_iterations=50,
+            parent_agent=parent,
+            task_count=1,
+            delegation_route=route,
+        )
+
+        self.assertEqual(
+            MockAgent.call_args.kwargs["reasoning_config"],
+            {"enabled": False},
+        )
+
+    @patch("run_agent.AIAgent")
+    def test_strong_route_uses_high_reasoning(self, MockAgent):
+        MockAgent.return_value = MagicMock()
+        parent = _make_mock_parent()
+        parent.reasoning_config = {"enabled": False}
+        _, route = _select_delegation_route(_make_route_class_config(), "strong")
+
+        _build_child_agent(
+            task_index=0,
+            goal="hard worker",
+            context=None,
+            toolsets=None,
+            model="grok-4.5",
+            max_iterations=50,
+            parent_agent=parent,
+            task_count=1,
+            delegation_route=route,
+        )
+
+        self.assertEqual(
+            MockAgent.call_args.kwargs["reasoning_config"],
+            {"enabled": True, "effort": "high"},
+        )
+
 
 # =========================================================================
 # Dispatch helper, progress events, concurrency
@@ -2408,11 +2677,13 @@ class TestDispatchDelegateTask(unittest.TestCase):
                 parent,
                 {
                     "goal": "test",
+                    "route_class": "fast",
                     "acp_command": "claude",
                     "acp_args": ["--acp", "--stdio"],
                     "tasks": [
                         {
                             "goal": "nested",
+                            "route_class": "strong",
                             "acp_command": "codex",
                             "acp_args": ["--acp"],
                         },
@@ -2423,8 +2694,10 @@ class TestDispatchDelegateTask(unittest.TestCase):
         self.assertNotIn("acp_command", captured)
         self.assertNotIn("acp_args", captured)
         self.assertEqual(captured["goal"], "test")
+        self.assertEqual(captured["route_class"], "fast")
         self.assertNotIn("acp_command", captured["tasks"][0])
         self.assertNotIn("acp_args", captured["tasks"][0])
+        self.assertEqual(captured["tasks"][0]["route_class"], "strong")
 
 class TestDelegateEventEnum(unittest.TestCase):
     """Tests for DelegateEvent enum and back-compat aliases."""

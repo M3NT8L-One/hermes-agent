@@ -439,7 +439,7 @@ def test_write_credential_pool_targets_profile_not_global(profile_env):
         "auth_type": "api_key",
         "priority": 0,
         "source": "manual",
-        "access_token": "sk-profile-new",
+        "access_token": "«redacted:sk-…»",
     }])
 
     # Global auth.json unchanged.
@@ -452,6 +452,7 @@ def test_write_credential_pool_targets_profile_not_global(profile_env):
 
     # Subsequent read returns profile (shadows global).
     assert [e["id"] for e in read_credential_pool("openrouter")] == ["prof-new"]
+
 
 
 def test_provider_state_transaction_locks_global_fallback_before_use(
@@ -520,7 +521,6 @@ def test_auth_lock_reentrancy_is_scoped_after_profile_context_switch(profile_env
             reset_hermes_home_override(token)
 
     assert getattr(holder_a, "depth", 0) == 0
-
 
 # ---------------------------------------------------------------------------
 # write_credential_pool — stale-snapshot cooldown merge
@@ -636,3 +636,144 @@ def test_write_pool_never_merges_cooldown_onto_reauthed_entry(classic_env):
     assert persisted["access_token"] == "sk-new"
     assert persisted.get("last_status") != "exhausted"
     assert persisted.get("last_error_code") is None
+
+
+def test_xai_runtime_refresh_from_global_pool_writes_root_only(profile_env):
+    """A profile refreshing borrowed root xAI OAuth must not create a local shadow."""
+    from hermes_cli.auth import _save_xai_oauth_tokens
+
+    _write(profile_env["global"] / "auth.json", _make_auth_store(
+        pool={
+            "xai-oauth": [{
+                "id": "root-xai",
+                "label": "root-xai",
+                "auth_type": "oauth",
+                "priority": 0,
+                "source": "device_code",
+                "access_token": "old-access",
+                "refresh_token": "old-refresh",
+            }],
+        },
+        providers={},
+    ))
+    _write(profile_env["profile"] / "auth.json", _make_auth_store(pool={}, providers={}))
+
+    _save_xai_oauth_tokens(
+        {"access_token": "new-access", "refresh_token": "new-refresh"},
+        discovery={"token_endpoint": "https://auth.x.ai/oauth/token"},
+        last_refresh="2026-06-30T12:00:00Z",
+    )
+
+    profile_data = json.loads((profile_env["profile"] / "auth.json").read_text())
+    assert "xai-oauth" not in profile_data.get("providers", {})
+    assert "xai-oauth" not in profile_data.get("credential_pool", {})
+
+    global_data = json.loads((profile_env["global"] / "auth.json").read_text())
+    root_state = global_data["providers"]["xai-oauth"]
+    assert root_state["tokens"]["access_token"] == "new-access"
+    assert root_state["tokens"]["refresh_token"] == "new-refresh"
+
+
+def test_xai_borrowed_pool_refresh_updates_global_pool_not_profile(profile_env, monkeypatch):
+    """Refreshing a root-inherited xAI pool entry keeps the token chain at root."""
+    _write(profile_env["global"] / "auth.json", _make_auth_store(
+        pool={
+            "xai-oauth": [{
+                "id": "root-xai",
+                "label": "root-xai",
+                "auth_type": "oauth",
+                "priority": 0,
+                "source": "device_code",
+                "access_token": "old-access",
+                "refresh_token": "old-refresh",
+            }],
+        },
+        providers={},
+    ))
+    _write(profile_env["profile"] / "auth.json", _make_auth_store(pool={}, providers={}))
+
+    import agent.credential_pool as credential_pool
+
+    monkeypatch.setattr(
+        credential_pool.auth_mod,
+        "refresh_xai_oauth_pure",
+        lambda access_token, refresh_token: {
+            "access_token": "new-access",
+            "refresh_token": "new-refresh",
+            "last_refresh": "2026-06-30T12:00:00Z",
+        },
+    )
+
+    pool = credential_pool.load_pool("xai-oauth")
+    entry = pool.entries()[0]
+    refreshed = pool._refresh_entry(entry, force=True)
+
+    assert refreshed is not None
+    assert refreshed.access_token == "new-access"
+    assert refreshed.refresh_token == "new-refresh"
+
+    profile_data = json.loads((profile_env["profile"] / "auth.json").read_text())
+    assert "xai-oauth" not in profile_data.get("providers", {})
+    assert "xai-oauth" not in profile_data.get("credential_pool", {})
+
+    global_data = json.loads((profile_env["global"] / "auth.json").read_text())
+    [root_entry] = global_data["credential_pool"]["xai-oauth"]
+    assert root_entry["access_token"] == "new-access"
+    assert root_entry["refresh_token"] == "new-refresh"
+
+
+def test_delegation_route_uses_global_xai_oauth_without_profile_shadow(profile_env):
+    """Named-profile workers resolve Team H routes from the one root OAuth pool."""
+    _write(profile_env["global"] / "auth.json", _make_auth_store(
+        pool={
+            "xai-oauth": [{
+                "id": "root-xai",
+                "label": "root-xai",
+                "auth_type": "oauth",
+                "priority": 0,
+                "source": "device_code",
+                "access_token": "root-access",
+                "refresh_token": "root-refresh",
+            }],
+        },
+        providers={},
+    ))
+    _write(profile_env["profile"] / "auth.json", _make_auth_store(
+        pool={},
+        providers={},
+    ))
+
+    from tools.delegate_tool import (
+        _resolve_delegation_credentials,
+        _select_delegation_route,
+    )
+
+    delegation = {
+        "provider": "xai-oauth",
+        "model": "grok-composer-2.5-fast",
+        "default_route_class": "fast",
+        "route_classes": {
+            "fast": {
+                "provider": "xai-oauth",
+                "model": "grok-composer-2.5-fast",
+                "reasoning_effort": "none",
+            },
+            "strong": {
+                "provider": "xai-oauth",
+                "model": "grok-4.5",
+                "reasoning_effort": "high",
+            },
+        },
+    }
+    selected, route = _select_delegation_route(delegation)
+    credentials = _resolve_delegation_credentials(route, object())
+
+    assert selected == "fast"
+    assert credentials["provider"] == "xai-oauth"
+    assert credentials["model"] == "grok-composer-2.5-fast"
+    assert credentials["api_key"] == "root-access"
+    assert credentials["api_mode"] == "codex_responses"
+
+    profile_data = json.loads((profile_env["profile"] / "auth.json").read_text())
+    assert "xai-oauth" not in profile_data.get("providers", {})
+    assert "xai-oauth" not in profile_data.get("credential_pool", {})

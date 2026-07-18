@@ -17,6 +17,7 @@ The parent's context only sees the delegation call and the summary result,
 never the child's intermediate tool calls or reasoning.
 """
 
+import copy
 import enum
 import json
 import logging
@@ -1086,6 +1087,10 @@ def _build_child_agent(
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
+    # Effective operator-configured route (top-level delegation config merged
+    # with one allowlisted route class).  None keeps the legacy behavior of
+    # reading the top-level delegation block directly.
+    delegation_route: Optional[Dict[str, Any]] = None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -1119,7 +1124,11 @@ def _build_child_agent(
     parent_subagent_id = getattr(parent_agent, "_subagent_id", None)
     tui_depth = max(0, child_depth - 1)  # 0 = first-level child for the UI
 
-    delegation_cfg = _load_config()
+    delegation_cfg = (
+        delegation_route
+        if isinstance(delegation_route, dict)
+        else _load_config()
+    )
 
     # When no explicit toolsets given, inherit from parent's enabled toolsets
     # so disabled tools (e.g. web) don't leak to subagents.
@@ -1931,6 +1940,7 @@ def _run_single_child(
                     if isinstance(getattr(child, "model", None), str)
                     else None
                 ),
+                "route_class": getattr(child, "_delegate_route_class", None),
                 "started_at": time.time(),
                 "status": "running",
                 "tool_count": 0,
@@ -2107,8 +2117,41 @@ def _run_single_child(
                 "exit_reason": "timeout" if is_timeout else "error",
                 "api_calls": child_api_calls,
                 "duration_seconds": duration,
+                "route_class": getattr(child, "_delegate_route_class", None),
                 "_child_role": getattr(child, "_delegate_role", None),
                 "diagnostic_path": diagnostic_path,
+                "cleanup_status": cleanup_status,
+            }
+        except Exception as _child_exc:
+            duration = round(time.monotonic() - child_start, 2)
+            logger.warning(
+                "Subagent %d raised %s after %.1fs",
+                task_index,
+                type(_child_exc).__name__,
+                duration,
+            )
+            if child_progress_cb:
+                try:
+                    child_progress_cb(
+                        "subagent.complete",
+                        preview=str(_child_exc),
+                        status="error",
+                        duration_seconds=duration,
+                        summary="",
+                    )
+                except Exception:
+                    pass
+            return {
+                "task_index": task_index,
+                "status": "error",
+                "summary": None,
+                "error": str(_child_exc),
+                "exit_reason": "error",
+                "api_calls": 0,
+                "duration_seconds": duration,
+                "route_class": getattr(child, "_delegate_route_class", None),
+                "_child_role": getattr(child, "_delegate_role", None),
+                "diagnostic_path": None,
             }
         finally:
             # Shut down executor without waiting — if the child thread
@@ -2202,6 +2245,7 @@ def _run_single_child(
             "api_calls": api_calls,
             "duration_seconds": duration,
             "model": _model if isinstance(_model, str) else None,
+            "route_class": getattr(child, "_delegate_route_class", None),
             "exit_reason": exit_reason,
             "tokens": {
                 "input": (
@@ -2429,12 +2473,97 @@ def _recover_tasks_from_json_string(
     return parsed, None
 
 
+def _configured_route_class_names(cfg: Optional[dict] = None) -> List[str]:
+    """Return the operator-configured delegation route-class allowlist.
+
+    Only mapping-valued entries are selectable.  Provider/model names remain
+    entirely inside config.yaml; the model sees and chooses only these opaque
+    class names.
+    """
+    cfg = cfg if isinstance(cfg, dict) else _load_config()
+    classes = cfg.get("route_classes")
+    if not isinstance(classes, dict):
+        return []
+    return sorted(
+        str(name)
+        for name, route in classes.items()
+        if str(name).strip() and isinstance(route, dict)
+    )
+
+
+def _select_delegation_route(
+    cfg: dict,
+    requested_route_class: Optional[str] = None,
+) -> tuple[Optional[str], dict]:
+    """Resolve one allowlisted route class into an effective route config.
+
+    Legacy configs with only ``delegation.provider`` / ``model`` are returned
+    unchanged.  When route classes are configured, a caller may select only an
+    exact configured class name; arbitrary provider/model input is never
+    accepted by the tool.  The selected class overlays the legacy top-level
+    route so operational keys such as iteration/concurrency limits remain
+    config-authoritative.
+    """
+    if not isinstance(cfg, dict):
+        cfg = {}
+
+    raw_classes = cfg.get("route_classes")
+    default_name = str(cfg.get("default_route_class") or "").strip()
+    requested_name = (
+        str(requested_route_class).strip()
+        if requested_route_class is not None
+        else ""
+    )
+
+    if raw_classes in (None, {}):
+        if requested_name:
+            raise ValueError(
+                f"Unknown delegation route_class {requested_name!r}: no route "
+                "classes are configured. Configure delegation.route_classes "
+                "or omit route_class to use the legacy delegation route."
+            )
+        if default_name:
+            raise ValueError(
+                "delegation.default_route_class is set but "
+                "delegation.route_classes is empty"
+            )
+        return None, cfg
+
+    if not isinstance(raw_classes, dict):
+        raise ValueError("delegation.route_classes must be a mapping")
+
+    selected_name = requested_name or default_name
+    if not selected_name:
+        # Backward compatibility: merely defining future classes does not
+        # change existing callers until a default or selector opts into one.
+        return None, cfg
+
+    selected = raw_classes.get(selected_name)
+    available = _configured_route_class_names(cfg)
+    if not isinstance(selected, dict):
+        choices = ", ".join(available) if available else "<none>"
+        raise ValueError(
+            f"Unknown delegation route_class {selected_name!r}. "
+            f"Allowed classes: {choices}."
+        )
+
+    effective = {
+        key: copy.deepcopy(value)
+        for key, value in cfg.items()
+        if key not in {"default_route_class", "route_classes"}
+    }
+    for key, value in selected.items():
+        effective[key] = copy.deepcopy(value)
+    return selected_name, effective
+
+
 def delegate_task(
     goal: Optional[str] = None,
     context: Optional[str] = None,
     tasks: Optional[List[Dict[str, Any]]] = None,
     max_iterations: Optional[int] = None,
     role: Optional[str] = None,
+    route_class: Optional[str] = None,
     background: Optional[bool] = None,
     parent_agent=None,
 ) -> str:
@@ -2442,13 +2571,18 @@ def delegate_task(
     Spawn one or more child agents to handle delegated tasks.
 
     Supports two modes:
-      - Single: provide goal (+ optional context and role)
-      - Batch:  provide tasks array [{goal, context, role}, ...]
+      - Single: provide goal (+ optional context, role, route_class)
+      - Batch:  provide tasks array [{goal, context, role, route_class}, ...]
 
     The 'role' parameter controls whether a child can further delegate:
     'leaf' (default) cannot; 'orchestrator' retains the delegation
     toolset and can spawn its own workers, bounded by
     delegation.max_spawn_depth.  Per-task role beats the top-level one.
+
+    ``route_class`` may select only an operator-configured allowlist entry.
+    Per-task route_class beats the top-level selector; omission uses
+    delegation.default_route_class when configured, otherwise the legacy
+    delegation.provider/model route.
 
     Returns JSON with results array, one entry per task.
     """
@@ -2509,16 +2643,6 @@ def delegate_task(
         )
     effective_max_iter = default_max_iter
 
-    # Resolve delegation credentials (provider:model pair).
-    # When delegation.provider is configured, this resolves the full credential
-    # bundle (base_url, api_key, api_mode) via the same runtime provider system
-    # used by CLI/gateway startup.  When unconfigured, returns None values so
-    # children inherit from the parent.
-    try:
-        creds = _resolve_delegation_credentials(cfg, parent_agent)
-    except ValueError as exc:
-        return tool_error(str(exc))
-
     # Normalize to task list
     max_children = _get_max_concurrent_children()
     recovered_tasks, tasks_error = _recover_tasks_from_json_string(tasks)
@@ -2538,7 +2662,14 @@ def delegate_task(
             )
         task_list = tasks
     elif goal and isinstance(goal, str) and goal.strip():
-        task_list = [{"goal": goal, "context": context, "role": top_role}]
+        task_list = [
+            {
+                "goal": goal,
+                "context": context,
+                "role": top_role,
+                "route_class": route_class,
+            }
+        ]
     else:
         return tool_error("Provide either 'goal' (single task) or 'tasks' (batch).")
 
@@ -2553,6 +2684,30 @@ def delegate_task(
             )
         if not task.get("goal", "").strip():
             return tool_error(f"Task {i} is missing a 'goal'.")
+
+    # Resolve and validate every requested class before constructing any child,
+    # so one bad item in a batch cannot create a partial fan-out.  Credential
+    # resolution stays on the existing runtime-provider path and therefore
+    # retains global/profile credential-pool inheritance.
+    prepared_routes: List[tuple[Optional[str], dict, dict]] = []
+    for task in task_list:
+        requested_class = task.get("route_class")
+        if requested_class is None:
+            requested_class = route_class
+        try:
+            selected_class, effective_route = _select_delegation_route(
+                cfg,
+                requested_class,
+            )
+            credentials = _resolve_delegation_credentials(
+                effective_route,
+                parent_agent,
+            )
+        except ValueError as exc:
+            return tool_error(str(exc))
+        prepared_routes.append(
+            (selected_class, effective_route, credentials)
+        )
 
     overall_start = time.monotonic()
     results = []
@@ -2601,6 +2756,7 @@ def delegate_task(
     children = []
     try:
         for i, t in enumerate(task_list):
+            selected_class, effective_route, creds = prepared_routes[i]
             # Per-task role beats top-level; normalise again so unknown
             # per-task values warn and degrade to leaf uniformly.
             effective_role = _normalize_role(t.get("role") or top_role)
@@ -2624,7 +2780,9 @@ def delegate_task(
                 override_acp_command=creds.get("command"),
                 override_acp_args=creds.get("args"),
                 role=effective_role,
+                delegation_route=effective_route,
             )
+            child._delegate_route_class = selected_class
             # Override with correct parent tool names (before child construction mutated global)
             child._delegate_saved_tool_names = _parent_tool_names
             # Tee the child's progress events into its live transcript log.
@@ -3392,6 +3550,9 @@ def _build_top_level_description() -> str:
         orchestrator_on = _get_orchestrator_enabled()
     except Exception:
         orchestrator_on = True
+    cfg = _load_config()
+    route_classes = _configured_route_class_names(cfg)
+    default_route_class = str(cfg.get("default_route_class") or "").strip()
 
     if max_depth >= 2 and orchestrator_on:
         nesting_clause = (
@@ -3413,6 +3574,25 @@ def _build_top_level_description() -> str:
             f"(max_spawn_depth={max_depth}): every child is a leaf and "
             f"cannot delegate further. Raise delegation.max_spawn_depth in "
             f"config.yaml to enable nesting."
+        )
+
+    if route_classes:
+        class_list = ", ".join(route_classes)
+        default_note = (
+            f" Omit route_class to use {default_route_class!r}."
+            if default_route_class in route_classes
+            else " Omit route_class to use the legacy configured route."
+        )
+        route_clause = (
+            "Subagent provider/model is selectable only through the "
+            f"configured route_class allowlist ({class_list}).{default_note} "
+            "Arbitrary provider/model values are not accepted by this tool."
+        )
+    else:
+        route_clause = (
+            "Subagent model is not selectable per call: children inherit the "
+            "parent model (plus its fallback chain) unless all subagents are "
+            "pinned through delegation.provider / delegation.model in config.yaml."
         )
 
     return (
@@ -3475,7 +3655,7 @@ def _build_top_level_description() -> str:
         f"Orchestrators are bounded by max_spawn_depth={max_depth} for this "
         f"user and can be disabled globally via "
         "delegation.orchestrator_enabled=false.\n"
-        "- Subagent model is NOT selectable per call: children inherit the parent model (plus its fallback chain) unless you pin all subagents to a model via delegation.provider / delegation.model in config.yaml.\n"
+        f"- {route_clause}\n"
         "- Each subagent gets its own terminal session (separate working directory and state).\n"
         "- Results are always returned as an array, one entry per task."
     )
@@ -3532,6 +3712,23 @@ def _build_role_param_description() -> str:
     )
 
 
+def _build_route_class_param_description(cfg: Optional[dict] = None) -> str:
+    cfg = cfg if isinstance(cfg, dict) else _load_config()
+    names = _configured_route_class_names(cfg)
+    default_name = str(cfg.get("default_route_class") or "").strip()
+    choices = ", ".join(names)
+    default_note = (
+        f" Omit it to use {default_name!r}."
+        if default_name in names
+        else " Omit it to use the legacy configured delegation route."
+    )
+    return (
+        "Operator-configured routing class for this child. Allowed values: "
+        f"{choices}.{default_note} This selects an allowlisted config route, "
+        "not an arbitrary provider or model."
+    )
+
+
 def _build_dynamic_schema_overrides() -> dict:
     """Return per-call schema overrides reflecting current config.
 
@@ -3539,15 +3736,25 @@ def _build_dynamic_schema_overrides() -> dict:
     get_definitions() pass rewrites the description fields to the user's
     actual limits.
     """
-    overrides_params = {
-        **DELEGATE_TASK_SCHEMA["parameters"],
-    }
-    # Deep-copy properties so we don't mutate the static schema dict.
-    overrides_params["properties"] = {
-        k: dict(v) for k, v in DELEGATE_TASK_SCHEMA["parameters"]["properties"].items()
-    }
+    overrides_params = copy.deepcopy(DELEGATE_TASK_SCHEMA["parameters"])
     overrides_params["properties"]["tasks"]["description"] = _build_tasks_param_description()
     overrides_params["properties"]["role"]["description"] = _build_role_param_description()
+
+    cfg = _load_config()
+    route_classes = _configured_route_class_names(cfg)
+    top_properties = overrides_params["properties"]
+    task_properties = top_properties["tasks"]["items"]["properties"]
+    if route_classes:
+        route_description = _build_route_class_param_description(cfg)
+        for properties in (top_properties, task_properties):
+            properties["route_class"]["enum"] = route_classes
+            properties["route_class"]["description"] = route_description
+    else:
+        # Do not expose an unconstrained string selector when the operator has
+        # not configured an allowlist. Runtime validation still rejects a
+        # programmatic unknown class.
+        top_properties.pop("route_class", None)
+        task_properties.pop("route_class", None)
 
     return {
         "description": _build_top_level_description(),
@@ -3604,6 +3811,10 @@ DELEGATE_TASK_SCHEMA = {
                             "enum": ["leaf", "orchestrator"],
                             "description": "Per-task role override. See top-level 'role' for semantics.",
                         },
+                        "route_class": {
+                            "type": "string",
+                            "description": "(rebuilt at get_definitions() time)",
+                        },
                     },
                     "required": ["goal"],
                 },
@@ -3615,6 +3826,10 @@ DELEGATE_TASK_SCHEMA = {
             "role": {
                 "type": "string",
                 "enum": ["leaf", "orchestrator"],
+                "description": "(rebuilt at get_definitions() time)",
+            },
+            "route_class": {
+                "type": "string",
                 "description": "(rebuilt at get_definitions() time)",
             },
             "background": {
@@ -3688,6 +3903,7 @@ registry.register(
         tasks=_strip_model_hidden_task_fields(args.get("tasks")),
         max_iterations=args.get("max_iterations"),
         role=args.get("role"),
+        route_class=args.get("route_class"),
         background=_model_background_value(args, kw.get("parent_agent")),
         parent_agent=kw.get("parent_agent"),
     ),
