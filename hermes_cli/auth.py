@@ -608,10 +608,20 @@ def _resolve_api_key_provider_secret(
         from agent.credential_pool import load_pool
         pool = load_pool(provider_id)
         if pool and pool.has_credentials():
-            entry = pool.peek()
-            if entry:
-                key = getattr(entry, "access_token", "") or getattr(entry, "runtime_api_key", "")
-                key = str(key).strip()
+            preferred = pool.peek()
+            entries = ([preferred] if preferred is not None else []) + [
+                entry for entry in pool.entries() if entry is not preferred
+            ]
+            for entry in entries:
+                # Real PooledCredential instances expose API keys through
+                # runtime_api_key, but older/custom pool entries may only
+                # carry access_token.  Keep that compatibility while still
+                # walking past empty placeholder entries.
+                key = str(
+                    getattr(entry, "runtime_api_key", "")
+                    or getattr(entry, "access_token", "")
+                    or ""
+                ).strip()
                 if has_usable_secret(key):
                     return key, f"credential_pool:{provider_id}"
     except Exception:
@@ -4457,11 +4467,16 @@ def _save_xai_oauth_tokens(
         last_refresh = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     with _auth_store_lock():
         auth_store = _load_auth_store()
-        # A profile that lacks its own xai-oauth block is reading the root
-        # grant through _load_provider_state's fallback. When such a profile
-        # refreshes the (rotating) grant, we must write the rotated chain back
-        # to root too, or root is left holding a revoked refresh token (#43589).
-        write_through_to_root = not _profile_has_own_xai_oauth_state(auth_store)
+        # A profile that lacks its own xai-oauth block is borrowing the root
+        # grant through _load_provider_state/_read_xai_oauth_tokens fallback.
+        # xAI refresh tokens are single-use, so the rotated chain must remain
+        # at the root. Writing it into the profile creates a local shadow; the
+        # next refresh from that long-running worker then advances only the
+        # profile and leaves root with the consumed token (#43589/#48415).
+        write_root_only = (
+            _global_auth_file_path() is not None
+            and not _profile_has_own_xai_oauth_state(auth_store)
+        )
         state = _load_provider_state(auth_store, "xai-oauth") or {}
         state["tokens"] = tokens
         state["last_refresh"] = last_refresh
@@ -4470,10 +4485,11 @@ def _save_xai_oauth_tokens(
             state["discovery"] = discovery
         if redirect_uri:
             state["redirect_uri"] = redirect_uri
-        _save_provider_state(auth_store, "xai-oauth", state)
-        _save_auth_store(auth_store)
-        if write_through_to_root:
+        if write_root_only:
             _write_through_xai_oauth_to_global_root(state)
+        else:
+            _save_provider_state(auth_store, "xai-oauth", state)
+            _save_auth_store(auth_store)
 
 
 def _xai_access_token_is_expiring(access_token: str, skew_seconds: int = 0) -> bool:

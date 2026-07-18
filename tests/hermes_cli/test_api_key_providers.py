@@ -2,6 +2,7 @@
 
 import json
 import os
+from types import SimpleNamespace
 
 import pytest
 
@@ -363,6 +364,29 @@ class TestApiKeyProviderStatus:
         status = get_api_key_provider_status("zai")
         assert status["configured"] is True
         assert status["key_source"] == "ZAI_API_KEY"
+
+    def test_status_skips_empty_pool_placeholder_before_global_manual_key(
+        self, monkeypatch
+    ):
+        """Profile status must see an inherited usable fallback pool entry."""
+        empty = SimpleNamespace(runtime_api_key="", label="XAI_API_KEY")
+        manual = SimpleNamespace(runtime_api_key="xai-test-fallback-key", label="global")
+
+        class _Pool:
+            def has_credentials(self):
+                return True
+
+            def peek(self):
+                return empty
+
+            def entries(self):
+                return [empty, manual]
+
+        monkeypatch.setattr("agent.credential_pool.load_pool", lambda provider: _Pool())
+        status = get_api_key_provider_status("xai")
+        assert status["configured"] is True
+        assert status["logged_in"] is True
+        assert status["key_source"] == "credential_pool:xai"
 
     def test_custom_base_url(self, monkeypatch):
         monkeypatch.setenv("KIMI_API_KEY", "kimi-key")
