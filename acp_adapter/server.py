@@ -1441,7 +1441,10 @@ class HermesACPAgent(acp.Agent):
         state = self.session_manager.get_session(session_id)
         if state and state.cancel_event:
             with state.runtime_lock:
-                if state.is_running and state.current_prompt_text:
+                if not state.is_running:
+                    logger.info("Ignored cancel for idle session %s", session_id)
+                    return
+                if state.current_prompt_text:
                     state.interrupted_prompt_text = state.current_prompt_text
                 # Publish cancellation and hard-stop the agent before another
                 # prompt can acquire this lock and mistake the turn for

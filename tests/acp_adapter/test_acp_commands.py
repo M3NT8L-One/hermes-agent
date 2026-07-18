@@ -20,6 +20,10 @@ class FakeAgent:
         self.steers = []
         self.redirects = []
         self.runs = []
+        self.interrupts = []
+
+    def interrupt(self, message=None):
+        self.interrupts.append(message)
 
     def steer(self, text):
         self.steers.append(text)
@@ -118,6 +122,24 @@ def test_acp_real_agent_gets_session_db_for_recall(monkeypatch):
     assert captured["session_db"] is sentinel_db
     assert captured["platform"] == "acp"
     assert captured["session_id"] == "acp-session"
+
+
+@pytest.mark.asyncio
+async def test_acp_cancel_on_idle_session_does_not_poison_next_prompt():
+    acp_agent, state, fake, _conn = make_agent_and_state()
+
+    await acp_agent.cancel(state.session_id)
+
+    assert fake.interrupts == []
+    assert not state.cancel_event.is_set()
+
+    response = await acp_agent.prompt(
+        session_id=state.session_id,
+        prompt=[TextContentBlock(type="text", text="inspect the workspace")],
+    )
+
+    assert response.stop_reason == "end_turn"
+    assert fake.runs == ["inspect the workspace"]
 
 
 @pytest.mark.asyncio
