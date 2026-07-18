@@ -29,9 +29,15 @@ shape with no mode parameter, no summary LLM path, and explicit scroll
 support.
 """
 
+import hashlib
 import json
 import logging
+import os
+import tempfile
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
+
+from hermes_constants import get_hermes_home
 
 # Sources that are excluded from session browsing/searching by default.
 # Third-party integrations tag their sessions with HERMES_SESSION_SOURCE=tool;
@@ -64,6 +70,307 @@ _COMPACTION_PREFIXES = (
     "[CONTEXT COMPACTION",
     "[CONTEXT SUMMARY]:",
 )
+# A single message can contain an entire terminal/browser transcript. Anchored
+# discovery then repeats that message in the match window and bookends, so one
+# otherwise narrow lookup can inject hundreds of kilobytes back into the model
+# immediately after context compression. Keep ordinary results byte-for-byte
+# unchanged, but make oversized results artifact-first: preserve the exact JSON
+# privately on disk and return real, bounded excerpts plus cursors.
+_MAX_INLINE_RESULT_BYTES = 32 * 1024
+_MAX_PREVIEW_RESULTS = 5
+_MAX_PREVIEW_MESSAGES = 5
+_MESSAGE_EXCERPT_CHARS = 600
+_TEXT_EXCERPT_CHARS = 800
+
+
+def _truncate_text(value: Any, limit: int = _TEXT_EXCERPT_CHARS) -> Any:
+    """Return a visibly marked prefix for long strings; leave other values alone."""
+    if not isinstance(value, str) or len(value) <= limit:
+        return value
+    omitted = len(value) - limit
+    return f"{value[:limit]}\n… [{omitted} characters omitted; complete value in artifact]"
+
+
+def _excerpt_value(value: Any, *, string_limit: int = _MESSAGE_EXCERPT_CHARS) -> Any:
+    """Bound nested message metadata such as tool calls while retaining useful fields."""
+    if isinstance(value, str):
+        return _truncate_text(value, string_limit)
+    if isinstance(value, dict):
+        return {k: _excerpt_value(v, string_limit=string_limit) for k, v in value.items()}
+    if isinstance(value, list):
+        kept = value[:3]
+        excerpt = [_excerpt_value(v, string_limit=string_limit) for v in kept]
+        if len(value) > len(kept):
+            excerpt.append({"_omitted_items": len(value) - len(kept)})
+        return excerpt
+    return value
+
+
+def _message_excerpt(message: Dict[str, Any]) -> Dict[str, Any]:
+    """Keep message identity/cursor fields while bounding every textual value."""
+    return {
+        key: _excerpt_value(value, string_limit=_MESSAGE_EXCERPT_CHARS)
+        for key, value in message.items()
+    }
+
+
+def _select_message_excerpts(
+    messages: List[Dict[str, Any]],
+    limit: int = _MAX_PREVIEW_MESSAGES,
+) -> tuple[List[Dict[str, Any]], int]:
+    """Select first/last/anchor messages so previews remain useful for scrolling."""
+    if len(messages) <= limit:
+        return [_message_excerpt(m) for m in messages], 0
+
+    indices = list(range((limit + 1) // 2))
+    indices.extend(range(len(messages) - (limit // 2), len(messages)))
+    anchor_index = next((i for i, m in enumerate(messages) if m.get("anchor")), None)
+    if anchor_index is not None and anchor_index not in indices:
+        # Preserve both boundaries and replace the last leading context item.
+        replace_at = max(1, ((limit + 1) // 2) - 1)
+        indices[replace_at] = anchor_index
+    indices = sorted(set(indices))
+    selected = [_message_excerpt(messages[i]) for i in indices]
+    return selected, len(messages) - len(selected)
+
+
+def _discover_result_excerpt(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Preserve discovery identity and real evidence while trimming repeated windows."""
+    excerpt: Dict[str, Any] = {}
+    for key, value in result.items():
+        if key in ("bookend_start", "messages", "bookend_end"):
+            messages, omitted = _select_message_excerpts(
+                value if isinstance(value, list) else [],
+                limit=2 if key != "messages" else _MAX_PREVIEW_MESSAGES,
+            )
+            excerpt[key] = messages
+            if omitted:
+                excerpt[f"{key}_omitted"] = omitted
+        else:
+            excerpt[key] = _excerpt_value(value, string_limit=_TEXT_EXCERPT_CHARS)
+    return excerpt
+
+
+def _cursor_guidance(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Return mode-specific, structured follow-up arguments for bounded retrieval."""
+    mode = payload.get("mode")
+    if mode == "discover":
+        calls = []
+        for result in payload.get("results") or []:
+            sid = result.get("session_id")
+            mid = result.get("match_message_id")
+            if sid and mid is not None:
+                calls.append({
+                    "session_id": sid,
+                    "around_message_id": mid,
+                    "window": 5,
+                })
+            if len(calls) >= _MAX_PREVIEW_RESULTS:
+                break
+        return {
+            "guidance": "Drill into one match with session_search using a suggested call.",
+            "suggested_calls": calls,
+        }
+
+    messages = payload.get("messages") or []
+    first_id = messages[0].get("id") if messages else None
+    last_id = messages[-1].get("id") if messages else None
+    session_id = payload.get("session_id")
+    if mode == "scroll":
+        return {
+            "guidance": (
+                "Scroll backward with the first id or forward with the last id; "
+                "the boundary message will overlap."
+            ),
+            "backward": {
+                "session_id": session_id,
+                "around_message_id": first_id,
+                "window": payload.get("window", 5),
+            },
+            "forward": {
+                "session_id": session_id,
+                "around_message_id": last_id,
+                "window": payload.get("window", 5),
+            },
+            "messages_before": payload.get("messages_before", 0),
+            "messages_after": payload.get("messages_after", 0),
+        }
+    if mode == "read":
+        anchor = first_id if first_id is not None else last_id
+        return {
+            "guidance": (
+                "Use session_search with this session id and an anchor message id "
+                "to retrieve a focused window."
+            ),
+            "suggested_call": {
+                "session_id": session_id,
+                "around_message_id": anchor,
+                "window": 5,
+            },
+            "first_message_id": first_id,
+            "last_message_id": last_id,
+        }
+    return {
+        "guidance": "Narrow the query or read one session by id for focused evidence.",
+    }
+
+
+def _write_full_result_artifact(content: bytes, digest: str, mode: str) -> Path:
+    """Atomically persist exact result bytes in a private, profile-aware directory."""
+    artifact_root = get_hermes_home() / "artifacts"
+    artifact_dir = artifact_root / "session-search"
+    artifact_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    artifact_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(artifact_root, 0o700)
+    os.chmod(artifact_dir, 0o700)
+
+    safe_mode = mode if mode in {"browse", "discover", "read", "scroll"} else "result"
+    path = artifact_dir / f"{safe_mode}-{digest}.json"
+    tmp_path: Optional[Path] = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=artifact_dir,
+            prefix=".session-search-",
+            delete=False,
+        ) as handle:
+            tmp_path = Path(handle.name)
+            os.chmod(tmp_path, 0o600)
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, path)
+        tmp_path = None
+        os.chmod(path, 0o600)
+        return path
+    finally:
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                logging.debug("Failed to remove session-search temp artifact", exc_info=True)
+
+
+def _build_bounded_preview(
+    payload: Dict[str, Any],
+    artifact: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Build the inline structured excerpt without duplicating the full evidence."""
+    mode = payload.get("mode")
+    preview: Dict[str, Any] = {}
+    for key, value in payload.items():
+        if key in ("results", "messages"):
+            continue
+        preview[key] = _excerpt_value(value, string_limit=_TEXT_EXCERPT_CHARS)
+
+    if mode == "discover":
+        results = payload.get("results") or []
+        preview["results"] = [
+            _discover_result_excerpt(result)
+            for result in results[:_MAX_PREVIEW_RESULTS]
+        ]
+        if len(results) > len(preview["results"]):
+            preview["inline_results_omitted"] = len(results) - len(preview["results"])
+    elif mode in ("read", "scroll"):
+        messages, omitted = _select_message_excerpts(payload.get("messages") or [])
+        preview["messages"] = messages
+        if omitted:
+            preview["inline_messages_omitted"] = omitted
+    elif "results" in payload:
+        results = payload.get("results") or []
+        preview["results"] = [
+            _excerpt_value(result, string_limit=_TEXT_EXCERPT_CHARS)
+            for result in results[:_MAX_PREVIEW_RESULTS]
+        ]
+        if len(results) > len(preview["results"]):
+            preview["inline_results_omitted"] = len(results) - len(preview["results"])
+
+    preview["bounded"] = True
+    preview["inline_truncated"] = True
+    preview["artifact"] = artifact
+    preview["cursor"] = _cursor_guidance(payload)
+    preview["message"] = (
+        "Oversized session_search result was bounded inline. Real excerpts are shown; "
+        "the artifact preserves the exact complete JSON. Use cursor guidance for "
+        "focused follow-up calls."
+    )
+    return preview
+
+
+def _bound_session_search_result(result: str) -> str:
+    """Return small JSON unchanged; artifact and excerpt oversized successful JSON."""
+    encoded = result.encode("utf-8")
+    if len(encoded) <= _MAX_INLINE_RESULT_BYTES:
+        return result
+
+    try:
+        payload = json.loads(result)
+    except (TypeError, ValueError):
+        logging.warning("Oversized session_search result was not valid JSON")
+        payload = {
+            "success": False,
+            "mode": "result",
+            "raw_excerpt": _truncate_text(result, _MESSAGE_EXCERPT_CHARS),
+            "message": "Oversized session_search result was not valid JSON.",
+        }
+    if not isinstance(payload, dict):
+        logging.warning("Oversized session_search result was not a JSON object")
+        payload = {
+            "success": False,
+            "mode": "result",
+            "raw_excerpt": _truncate_text(result, _MESSAGE_EXCERPT_CHARS),
+            "message": "Oversized session_search result was not a JSON object.",
+        }
+
+    digest = hashlib.sha256(encoded).hexdigest()
+    artifact: Dict[str, Any] = {
+        "complete": False,
+        "path": None,
+        "sha256": digest,
+        "size_bytes": len(encoded),
+        "encoding": "utf-8",
+    }
+    try:
+        artifact_path = _write_full_result_artifact(
+            encoded,
+            digest,
+            str(payload.get("mode") or "result"),
+        )
+        artifact.update({"complete": True, "path": str(artifact_path)})
+    except Exception:
+        # Never put the full payload back inline when persistence fails: that
+        # recreates the context blow-up this boundary exists to prevent.
+        logging.warning("Failed to persist oversized session_search artifact", exc_info=True)
+        artifact["error"] = "artifact_write_failed"
+
+    preview = _build_bounded_preview(payload, artifact)
+    rendered = json.dumps(preview, ensure_ascii=False)
+    if len(rendered.encode("utf-8")) <= _MAX_INLINE_RESULT_BYTES:
+        return rendered
+
+    # Pathological metadata (for example a giant title or tool-call object)
+    # should still never break the hard boundary. Keep one real excerpt and all
+    # artifact/cursor receipts in a compact fallback.
+    messages = payload.get("messages") or []
+    first_message = _message_excerpt(messages[0]) if messages else None
+    results = payload.get("results") or []
+    first_result = _discover_result_excerpt(results[0]) if results else None
+    compact = {
+        "success": payload.get("success", True),
+        "mode": payload.get("mode"),
+        "bounded": True,
+        "inline_truncated": True,
+        "excerpt": first_message or first_result,
+        "artifact": artifact,
+        "cursor": _cursor_guidance(payload),
+        "message": "Oversized session_search result; compact inline excerpt only.",
+    }
+    rendered = json.dumps(compact, ensure_ascii=False)
+    if len(rendered.encode("utf-8")) <= _MAX_INLINE_RESULT_BYTES:
+        return rendered
+
+    compact["excerpt"] = _truncate_text(json.dumps(compact["excerpt"], ensure_ascii=False), 256)
+    return json.dumps(compact, ensure_ascii=False)
 
 
 def _format_timestamp(ts: Union[int, float, str, None]) -> str:
@@ -837,12 +1144,14 @@ def session_search(
 
     # Scroll shape takes precedence — explicit anchor beats any query.
     if (isinstance(session_id, str) and session_id.strip()) and around_message_id is not None:
-        return _scroll(
-            db=db,
-            session_id=session_id,
-            around_message_id=around_message_id,
-            window=window,
-            current_session_id=current_session_id,
+        return _bound_session_search_result(
+            _scroll(
+                db=db,
+                session_id=session_id,
+                around_message_id=around_message_id,
+                window=window,
+                current_session_id=current_session_id,
+            )
         )
 
     # Read shape: a session_id with no anchor → dump the whole session.
@@ -850,7 +1159,7 @@ def session_search(
         sid = session_id.strip()
         result = _read_session(db, sid)
         if json.loads(result).get("success"):
-            return result
+            return _bound_session_search_result(result)
 
         # Miss in the target profile — the model may have dropped the owning
         # profile from the link. Scan every profile and read it from wherever
@@ -863,7 +1172,7 @@ def session_search(
                 located.close()
             if found.get("success"):
                 found["profile"] = owner
-                return json.dumps(found, ensure_ascii=False)
+                return _bound_session_search_result(json.dumps(found, ensure_ascii=False))
         return result
 
     # Limit clamp [1, 10]
@@ -876,7 +1185,7 @@ def session_search(
 
     # Browse shape: no query → recent sessions.
     if not query or not isinstance(query, str) or not query.strip():
-        return _list_recent_sessions(db, limit, current_session_id)
+        return _bound_session_search_result(_list_recent_sessions(db, limit, current_session_id))
 
     # Parse role_filter
     role_list: Optional[List[str]] = None
@@ -890,13 +1199,15 @@ def session_search(
         if candidate in ("newest", "oldest"):
             sort_norm = candidate
 
-    return _discover(
-        db=db,
-        query=query.strip(),
-        role_filter=role_list,
-        limit=limit,
-        sort=sort_norm,
-        current_session_id=current_session_id,
+    return _bound_session_search_result(
+        _discover(
+            db=db,
+            query=query.strip(),
+            role_filter=role_list,
+            limit=limit,
+            sort=sort_norm,
+            current_session_id=current_session_id,
+        )
     )
 
 
@@ -915,6 +1226,14 @@ SESSION_SEARCH_SCHEMA = {
         "Search past sessions stored in the local session DB, or scroll inside one. "
         "FTS5-backed retrieval over the SQLite message store. No LLM calls — every "
         "shape returns actual messages from the DB.\n\n"
+        "OUTPUT BOUNDS\n\n"
+        "  Normal results are returned unchanged. If a result would exceed the inline "
+        "response budget, session_search writes the exact complete JSON to a private, "
+        "profile-scoped artifact and returns real truncated excerpts with artifact "
+        "path, SHA-256, byte size, and structured cursor guidance. Use the suggested "
+        "session_id + around_message_id call to retrieve the next focused window; do "
+        "not repeat the broad search when the artifact or cursor already has the "
+        "evidence.\n\n"
         "SOURCE-FIRST LIMIT\n\n"
         "  This tool searches Hermes conversation history only. It is not evidence "
         "about the current contents of external sources. If the user provided a "

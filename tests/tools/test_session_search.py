@@ -7,8 +7,11 @@ Three calling shapes:
 
 All run zero LLM calls.
 """
+import hashlib
 import json
+import stat
 import time
+from pathlib import Path
 
 import pytest
 
@@ -16,6 +19,8 @@ from hermes_state import SessionDB
 from tools.session_search_tool import (
     SESSION_SEARCH_SCHEMA,
     _HIDDEN_SESSION_SOURCES,
+    _MAX_INLINE_RESULT_BYTES,
+    _bound_session_search_result,
     _format_timestamp,
     _is_compacted_message,
     _is_compression_ended,
@@ -108,6 +113,13 @@ class TestSchema:
         assert "direct source" in desc
         assert "session_search as secondary" in desc
         assert "not found" in desc
+
+    def test_schema_description_teaches_bounded_artifact_contract(self):
+        desc = SESSION_SEARCH_SCHEMA["description"].lower()
+        assert "output bounds" in desc
+        assert "profile-scoped artifact" in desc
+        assert "sha-256" in desc
+        assert "cursor guidance" in desc
 
 
 class TestHiddenSources:
@@ -490,6 +502,157 @@ class TestReadShape:
         assert result["message_count"] == 50
         assert result["truncated"] is True
         assert len(result["messages"]) == 30  # head 20 + tail 10
+
+
+# =========================================================================
+# Artifact-first response boundary
+# =========================================================================
+
+class TestBoundedArtifacts:
+    @staticmethod
+    def _assert_complete_artifact(result, hermes_home, mode):
+        artifact = result["artifact"]
+        path = Path(artifact["path"])
+        content = path.read_bytes()
+
+        assert result["bounded"] is True
+        assert result["inline_truncated"] is True
+        assert len(json.dumps(result, ensure_ascii=False).encode("utf-8")) <= _MAX_INLINE_RESULT_BYTES
+        assert artifact["complete"] is True
+        assert artifact["size_bytes"] == len(content)
+        assert artifact["size_bytes"] > _MAX_INLINE_RESULT_BYTES
+        assert artifact["sha256"] == hashlib.sha256(content).hexdigest()
+        assert path.parent == hermes_home / "artifacts" / "session-search"
+        assert path.name.startswith(f"{mode}-")
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
+        assert stat.S_IMODE(path.parent.parent.stat().st_mode) == 0o700
+        return json.loads(content)
+
+    def test_small_payload_is_returned_byte_for_byte(self):
+        original = json.dumps(
+            {
+                "success": True,
+                "mode": "read",
+                "messages": [{"id": 1, "content": "small π evidence"}],
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+
+        assert _bound_session_search_result(original) == original
+
+    def test_oversized_discover_writes_full_artifact_and_returns_cursors(
+        self, db, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / "profile-home"
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        db.create_session("s_discover_big", source="cli")
+        huge = "boundedneedle " + ("discover-evidence " * _MAX_INLINE_RESULT_BYTES)
+        anchor = db.append_message("s_discover_big", role="user", content=huge)
+        db.append_message("s_discover_big", role="assistant", content="resolution")
+        db._conn.commit()
+
+        rendered = session_search(query="boundedneedle", limit=1, db=db)
+        result = json.loads(rendered)
+        full = self._assert_complete_artifact(result, hermes_home, "discover")
+
+        assert result["mode"] == "discover"
+        assert "characters omitted" in json.dumps(result["results"], ensure_ascii=False)
+        assert result["cursor"]["suggested_calls"] == [
+            {
+                "session_id": "s_discover_big",
+                "around_message_id": anchor,
+                "window": 5,
+            }
+        ]
+        assert full["results"][0]["messages"][0]["content"] == huge
+
+    def test_oversized_read_writes_full_artifact_and_returns_anchor(
+        self, db, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / "profile-home"
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        db.create_session("s_read_big", source="cli")
+        huge = "read evidence " * _MAX_INLINE_RESULT_BYTES
+        message_id = db.append_message("s_read_big", role="user", content=huge)
+        db._conn.commit()
+
+        result = json.loads(session_search(session_id="s_read_big", db=db))
+        full = self._assert_complete_artifact(result, hermes_home, "read")
+
+        assert result["mode"] == "read"
+        assert result["messages"][0]["id"] == message_id
+        assert "characters omitted" in result["messages"][0]["content"]
+        assert result["cursor"]["suggested_call"] == {
+            "session_id": "s_read_big",
+            "around_message_id": message_id,
+            "window": 5,
+        }
+        assert full["messages"][0]["content"] == huge
+
+    def test_oversized_scroll_writes_full_artifact_and_returns_both_directions(
+        self, db, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / "profile-home"
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        db.create_session("s_scroll_big", source="cli")
+        first = db.append_message("s_scroll_big", role="user", content="before")
+        anchor = db.append_message(
+            "s_scroll_big",
+            role="assistant",
+            content="scroll evidence " * _MAX_INLINE_RESULT_BYTES,
+        )
+        last = db.append_message("s_scroll_big", role="user", content="after")
+        db._conn.commit()
+
+        result = json.loads(
+            session_search(
+                session_id="s_scroll_big",
+                around_message_id=anchor,
+                window=1,
+                db=db,
+            )
+        )
+        full = self._assert_complete_artifact(result, hermes_home, "scroll")
+
+        assert result["mode"] == "scroll"
+        assert result["cursor"]["backward"]["around_message_id"] == first
+        assert result["cursor"]["forward"]["around_message_id"] == last
+        assert full["messages"][1]["id"] == anchor
+        assert full["messages"][1]["content"].startswith("scroll evidence")
+
+    def test_artifact_write_failure_stays_bounded_and_structured(self, monkeypatch):
+        from tools import session_search_tool as module
+
+        def fail_write(*_args, **_kwargs):
+            raise OSError("simulated write failure")
+
+        monkeypatch.setattr(module, "_write_full_result_artifact", fail_write)
+        original = json.dumps(
+            {
+                "success": True,
+                "mode": "read",
+                "session_id": "s_failure",
+                "messages": [
+                    {
+                        "id": 1,
+                        "role": "user",
+                        "content": "x" * (_MAX_INLINE_RESULT_BYTES * 2),
+                    }
+                ],
+            }
+        )
+
+        rendered = _bound_session_search_result(original)
+        result = json.loads(rendered)
+
+        assert len(rendered.encode("utf-8")) <= _MAX_INLINE_RESULT_BYTES
+        assert result["bounded"] is True
+        assert result["artifact"]["complete"] is False
+        assert result["artifact"]["path"] is None
+        assert result["artifact"]["error"] == "artifact_write_failed"
+        assert result["artifact"]["sha256"] == hashlib.sha256(original.encode()).hexdigest()
 
 
 # =========================================================================
