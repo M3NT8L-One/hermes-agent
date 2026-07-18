@@ -532,10 +532,10 @@ class TestTerminalFormatting:
 
         assert "Input tokens" in text
         assert "Output tokens" in text
-        # Cost and cache metrics are intentionally hidden (pricing was unreliable).
+        # Token volume is observable even when cost/pricing is intentionally hidden.
         assert "Est. cost" not in text
-        assert "Cache read" not in text
-        assert "Cache write" not in text
+        assert "Cache read" in text
+        assert "Cache write" in text
 
     def test_terminal_format_shows_platforms(self, populated_db):
         engine = InsightsEngine(populated_db)
@@ -585,14 +585,15 @@ class TestGatewayFormatting:
 
         assert "**" in text  # Markdown bold
 
-    def test_gateway_format_hides_cost(self, populated_db):
-        """Gateway format omits dollar figures and internal cache details."""
+    def test_gateway_format_hides_cost_but_explains_total_token_volume(self, populated_db):
+        """Gateway omits unreliable dollar estimates but exposes cache volume."""
         engine = InsightsEngine(populated_db)
         report = engine.generate(days=30)
         text = engine.format_gateway(report)
 
         assert "$" not in text
-        assert "cache" not in text.lower()
+        assert "cache-read" in text
+        assert "cache-write" in text
 
     def test_gateway_format_shows_models(self, populated_db):
         engine = InsightsEngine(populated_db)

@@ -152,8 +152,9 @@ async def test_status_command_reads_token_totals_from_session_db():
 
     result = await runner._handle_message(_make_event("/status"))
 
+    # Official billing contract: include reasoning in the billed total.
     # 1000 + 250 + 500 + 100 + 50 = 1,900
-    assert "**Lifetime tokens billed:** 1,900" in result
+    assert "**Total tokens billed:** 1,900" in result
 
 
 @pytest.mark.asyncio
