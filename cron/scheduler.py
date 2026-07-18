@@ -3484,6 +3484,13 @@ def run_job(
             session_id=_cron_session_id,
             session_db=_session_db,
         )
+        # Scheduled prompts own their maintenance scope. Generic post-turn
+        # memory/skill review can mutate a loaded governance skill, create a new
+        # digest, and recursively wake another scheduled run. Match the curator's
+        # established non-recursive boundary for every cron agent. These runtime
+        # counters are supplied by the background-review mixin.
+        setattr(agent, "_memory_nudge_interval", 0)
+        setattr(agent, "_skill_nudge_interval", 0)
         
         # Run the agent with an *inactivity*-based timeout: the job can run
         # for hours if it's actively calling tools / receiving stream tokens,

@@ -1588,6 +1588,27 @@ class TestRunJobSessionPersistence:
         kwargs = mock_agent_cls.call_args.kwargs
         assert kwargs["enabled_toolsets"] == ["web", "terminal", "file"]
 
+    def test_run_job_disables_recursive_background_reviews(self, tmp_path):
+        """A cron job must not spawn post-turn memory or skill review.
+
+        Cron prompts already own their maintenance scope. Letting the generic
+        background reviewer run after a scheduled governance job can mutate a
+        loaded skill, create a new digest, and recursively wake governance.
+        """
+        job = {
+            "id": "non-recursive-job",
+            "name": "test",
+            "prompt": "hello",
+        }
+        with self._run_job_patches(tmp_path) as (_fake_db, mock_agent_cls):
+            mock_agent = mock_agent_cls.return_value
+            mock_agent._memory_nudge_interval = 10
+            mock_agent._skill_nudge_interval = 15
+            run_job(job)
+
+        assert mock_agent._memory_nudge_interval == 0
+        assert mock_agent._skill_nudge_interval == 0
+
     def test_run_job_disabled_toolsets_layer_user_config_on_baseline(self, tmp_path):
         """agent.disabled_toolsets must be honoured in cron — issue #25752.
 
