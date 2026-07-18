@@ -1061,9 +1061,15 @@ def _reset_for_tests() -> None:
     """Test-only: clear all state and tear down the executor."""
     global _executor, _executor_max_workers
     with _executor_lock:
-        if _executor is not None:
-            _executor.shutdown(wait=False)
+        old_executor = _executor
         _executor = None
         _executor_max_workers = 0
+
+    # A non-blocking shutdown lets an in-flight worker enqueue a completion
+    # after the queue has been drained, leaking that event into the next test.
+    # Wait before clearing shared state so reset is a true isolation boundary.
+    if old_executor is not None:
+        old_executor.shutdown(wait=True, cancel_futures=True)
+
     with _records_lock:
         _records.clear()

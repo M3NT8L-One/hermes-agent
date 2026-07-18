@@ -197,6 +197,37 @@ def _gateway_surface_passes_raw_text(platform: Any) -> bool:
     return _gateway_platform_value(platform) in _GATEWAY_RAW_TEXT_PLATFORMS
 
 
+def _agent_usage_snapshot(agent: Any) -> Dict[str, int]:
+    """Return canonical cumulative token buckets plus current window telemetry."""
+    def _nonnegative_int(value: Any) -> int:
+        if not isinstance(value, (bool, int, float, str)):
+            return 0
+        try:
+            return max(0, int(value or 0))
+        except (TypeError, ValueError, OverflowError):
+            return 0
+
+    compressor = getattr(agent, "context_compressor", None) if agent else None
+    return {
+        "input_tokens": _nonnegative_int(getattr(agent, "session_input_tokens", 0)),
+        "prompt_tokens": _nonnegative_int(getattr(agent, "session_prompt_tokens", 0)),
+        "cache_read_tokens": _nonnegative_int(
+            getattr(agent, "session_cache_read_tokens", 0)
+        ),
+        "cache_write_tokens": _nonnegative_int(
+            getattr(agent, "session_cache_write_tokens", 0)
+        ),
+        "output_tokens": _nonnegative_int(
+            getattr(agent, "session_completion_tokens", 0)
+        ),
+        "total_tokens": _nonnegative_int(getattr(agent, "session_total_tokens", 0)),
+        "last_prompt_tokens": _nonnegative_int(
+            getattr(compressor, "last_prompt_tokens", 0)
+        ),
+        "context_length": _nonnegative_int(getattr(compressor, "context_length", 0)),
+    }
+
+
 _GATEWAY_PROVIDER_ERROR_RE = re.compile(
     r"("  # infrastructure/provider error preambles, not ordinary assistant prose
     r"api\s+(?:call\s+)?failed"
@@ -22208,16 +22239,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             final_response = result.get("final_response")
 
             # Extract actual token counts from the agent instance used for this run
-            _last_prompt_toks = 0
-            _input_toks = 0
-            _output_toks = 0
-            _context_length = 0
             _agent = agent_holder[0]
-            if _agent and hasattr(_agent, "context_compressor"):
-                _last_prompt_toks = getattr(_agent.context_compressor, "last_prompt_tokens", 0)
-                _input_toks = getattr(_agent, "session_prompt_tokens", 0)
-                _output_toks = getattr(_agent, "session_completion_tokens", 0)
-                _context_length = getattr(_agent.context_compressor, "context_length", 0) or 0
+            _usage = _agent_usage_snapshot(_agent)
+            _last_prompt_toks = _usage["last_prompt_tokens"]
+            _input_toks = _usage["input_tokens"]
+            _prompt_toks = _usage["prompt_tokens"]
+            _cache_read_toks = _usage["cache_read_tokens"]
+            _cache_write_toks = _usage["cache_write_tokens"]
+            _output_toks = _usage["output_tokens"]
+            _total_toks = _usage["total_tokens"]
+            _context_length = _usage["context_length"]
             _resolved_model = getattr(_agent, "model", None) if _agent else None
 
             # Sync session_id immediately after run_conversation(). Compression
@@ -22345,7 +22376,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "session_id": effective_session_id,
                     "last_prompt_tokens": _last_prompt_toks,
                     "input_tokens": _input_toks,
+                    "prompt_tokens": _prompt_toks,
+                    "cache_read_tokens": _cache_read_toks,
+                    "cache_write_tokens": _cache_write_toks,
                     "output_tokens": _output_toks,
+                    "total_tokens": _total_toks,
                     "model": _resolved_model,
                     "context_length": _context_length,
                 }
@@ -22468,7 +22503,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "compacted_in_place": _compacted_in_place,
                 "last_prompt_tokens": _last_prompt_toks,
                 "input_tokens": _input_toks,
+                "prompt_tokens": _prompt_toks,
+                "cache_read_tokens": _cache_read_toks,
+                "cache_write_tokens": _cache_write_toks,
                 "output_tokens": _output_toks,
+                "total_tokens": _total_toks,
                 "model": _resolved_model,
                 "context_length": _context_length,
                 "session_id": effective_session_id,
