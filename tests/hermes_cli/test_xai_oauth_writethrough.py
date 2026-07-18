@@ -4,9 +4,10 @@ Companion to ``test_xai_oauth_profile_auth.py``. That file covers the READ
 fallback (profile -> credential pool -> global root). These cover the WRITE
 side: when a profile that has no own ``providers.xai-oauth`` block refreshes
 the (rotating) grant it resolved from the root fallback, the rotated tokens
-must be written back to the global root too. Otherwise root keeps a revoked
-refresh token and every other profile reading root's stale grant dies with
-``invalid_grant`` once its access token expires (issue #43589).
+must be written back to the global root without creating a profile-local shadow.
+Otherwise one worker can advance only its profile copy while root keeps a
+revoked refresh token, and every other profile reading root's stale grant dies
+with ``invalid_grant`` once its access token expires (issue #43589/#48415).
 
 The tests drive the real ``_save_xai_oauth_tokens`` against real on-disk auth
 stores (profile + root under ``tmp_path``) rather than mocking the save
@@ -75,9 +76,10 @@ def test_refresh_writes_through_to_root_when_profile_has_no_own_state(profile_an
     }
     auth._save_xai_oauth_tokens(rotated)
 
-    # Profile got the rotated chain (existing behavior).
+    # Root-borrowing profiles must NOT get a profile-local shadow; xAI refresh
+    # tokens are single-use, so the one canonical grant stays in the global root.
     profile = _read_store(profile_path)
-    assert profile["providers"]["xai-oauth"]["tokens"]["refresh_token"] == "new-refresh"
+    assert "xai-oauth" not in profile["providers"]
 
     # AND the global root no longer holds the revoked refresh token (#43589).
     root = _read_store(root_path)
@@ -147,13 +149,14 @@ def test_write_through_is_noop_in_classic_mode(tmp_path, monkeypatch):
     assert store["providers"]["xai-oauth"]["tokens"]["refresh_token"] == "r"
 
 
-def test_write_through_failure_does_not_break_profile_save(profile_and_root, monkeypatch):
-    """A failed root write-through must not break the profile's own save."""
+def test_write_through_failure_does_not_create_profile_shadow(profile_and_root, monkeypatch):
+    """A failed root write-through must not create a profile-local shadow."""
     profile_path, root_path = profile_and_root
     _write_store(profile_path, {"version": 1, "providers": {}})
     _write_store(root_path, {"version": 1, "providers": {}})
 
-    # Make the root write blow up; the profile save must still succeed.
+    # Make the root write blow up; the root-borrowing profile must still avoid
+    # creating a local shadow with what may be the only valid refresh token.
     real_save = auth._save_auth_store
 
     def _exploding_save(store, target_path=None):
@@ -166,4 +169,6 @@ def test_write_through_failure_does_not_break_profile_save(profile_and_root, mon
     auth._save_xai_oauth_tokens({"access_token": "a", "refresh_token": "r"})
 
     profile = _read_store(profile_path)
-    assert profile["providers"]["xai-oauth"]["tokens"]["refresh_token"] == "r"
+    root = _read_store(root_path)
+    assert "xai-oauth" not in profile["providers"]
+    assert "xai-oauth" not in root["providers"]

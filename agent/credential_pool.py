@@ -579,10 +579,123 @@ def _write_through_provider_state_to_global_root(
         )
 
 
+_ROOT_SHARED_POOL_WRITEBACK_PROVIDERS = frozenset({"xai-oauth"})
+
+
+def _auth_store_has_pool_entries(auth_store: Dict[str, Any], provider: str) -> bool:
+    pool = auth_store.get("credential_pool")
+    if not isinstance(pool, dict):
+        return False
+    entries = pool.get(provider)
+    return isinstance(entries, list) and bool(entries)
+
+
+def _auth_store_has_provider_state(auth_store: Dict[str, Any], provider: str) -> bool:
+    providers = auth_store.get("providers")
+    if not isinstance(providers, dict):
+        return False
+    return isinstance(providers.get(provider), dict)
+
+
+def _pool_entries_borrowed_from_global(provider: str) -> bool:
+    """True when active profile should treat provider pool updates as root-owned.
+
+    Profile reads can inherit root/global ``credential_pool`` entries and can
+    also seed a pool from a root/global singleton provider state.  Runtime
+    refresh/status writes for single-use OAuth grants must go back to root in
+    that case; writing them into the profile creates the local xAI shadow that
+    steals the rotating refresh-token chain from global.
+    """
+    if provider not in _ROOT_SHARED_POOL_WRITEBACK_PROVIDERS:
+        return False
+    try:
+        if auth_mod._global_auth_file_path() is None:
+            return False
+        auth_store = _load_auth_store()
+        if _auth_store_has_pool_entries(auth_store, provider):
+            return False
+        if _auth_store_has_provider_state(auth_store, provider):
+            return False
+        global_store = auth_mod._load_global_auth_store()
+        return (
+            _auth_store_has_pool_entries(global_store, provider)
+            or _auth_store_has_provider_state(global_store, provider)
+        )
+    except Exception:
+        return False
+
+
+def _write_through_credential_pool_to_global_root(
+    provider_id: str,
+    entries: List[Dict[str, Any]],
+    *,
+    removed_ids: Optional[List[str]] = None,
+) -> bool:
+    """Persist a borrowed/root-owned provider pool back to global auth.json."""
+    try:
+        global_path = auth_mod._global_auth_file_path()
+    except Exception:
+        return False
+    if global_path is None:
+        return False
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        real_home_env = os.environ.get("HOME", "")
+        if real_home_env:
+            real_root = Path(real_home_env) / ".hermes" / "auth.json"
+            try:
+                if global_path.resolve(strict=False) == real_root.resolve(strict=False):
+                    return False
+            except Exception:
+                return False
+    try:
+        if global_path.exists():
+            global_store = _load_auth_store(global_path)
+        else:
+            global_store = {}
+        if not isinstance(global_store, dict):
+            return False
+        pool = global_store.get("credential_pool")
+        if not isinstance(pool, dict):
+            pool = {}
+            global_store["credential_pool"] = pool
+        removed = {rid for rid in (removed_ids or ()) if rid}
+        sanitized_entries = [
+            sanitize_borrowed_credential_payload(entry, provider_id)
+            if isinstance(entry, dict) else entry
+            for entry in entries
+        ]
+        existing = pool.get(provider_id)
+        existing_list = existing if isinstance(existing, list) else []
+        new_ids = {
+            entry.get("id")
+            for entry in sanitized_entries
+            if isinstance(entry, dict) and entry.get("id")
+        }
+        merged: List[Dict[str, Any]] = list(sanitized_entries)
+        for disk_entry in existing_list:
+            if not isinstance(disk_entry, dict):
+                continue
+            disk_id = disk_entry.get("id")
+            if not disk_id or disk_id in new_ids or disk_id in removed:
+                continue
+            merged.append(sanitize_borrowed_credential_payload(disk_entry, provider_id))
+        pool[provider_id] = merged
+        auth_mod._save_auth_store(global_store, global_path)
+        return True
+    except Exception as exc:  # pragma: no cover - best effort
+        logger.debug(
+            "%s pool refresh: credential-pool write-through to global root failed: %s",
+            provider_id,
+            exc,
+        )
+        return False
+
+
 class CredentialPool:
-    def __init__(self, provider: str, entries: List[PooledCredential]):
+    def __init__(self, provider: str, entries: List[PooledCredential], *, borrowed_from_global_pool: bool = False):
         self.provider = provider
         self._entries = sorted(entries, key=lambda entry: entry.priority)
+        self._borrowed_from_global_pool = borrowed_from_global_pool
         self._current_id: Optional[str] = None
         self._strategy = get_pool_strategy(provider)
         self._lock = threading.Lock()
@@ -659,10 +772,33 @@ class CredentialPool:
                 self._entries[idx] = new
                 return
 
-    def _persist(self, *, removed_ids: Optional[List[str]] = None) -> None:
+    def _persist(
+        self,
+        *,
+        removed_ids: Optional[List[str]] = None,
+        write_to_origin_if_borrowed: bool = False,
+    ) -> None:
+        entries_payload = [entry.to_dict() for entry in self._entries]
+        if (
+            write_to_origin_if_borrowed
+            and self._borrowed_from_global_pool
+            and self.provider in _ROOT_SHARED_POOL_WRITEBACK_PROVIDERS
+        ):
+            wrote_root = _write_through_credential_pool_to_global_root(
+                self.provider,
+                entries_payload,
+                removed_ids=removed_ids,
+            )
+            if not wrote_root:
+                logger.warning(
+                    "%s borrowed credential_pool update could not be written to "
+                    "global root; refusing to create a profile-local shadow",
+                    self.provider,
+                )
+            return
         write_credential_pool(
             self.provider,
-            [entry.to_dict() for entry in self._entries],
+            entries_payload,
             removed_ids=removed_ids,
         )
 
@@ -720,7 +856,7 @@ class CredentialPool:
         )
         self._replace_entry(entry, updated)
         if persist:
-            self._persist()
+            self._persist(write_to_origin_if_borrowed=True)
         return updated
 
     def _sync_anthropic_entry_from_credentials_file(self, entry: PooledCredential) -> PooledCredential:
@@ -891,7 +1027,7 @@ class CredentialPool:
                     field_updates["last_refresh"] = state["last_refresh"]
                 updated = replace(entry, **field_updates)
                 self._replace_entry(entry, updated)
-                self._persist()
+                self._persist(write_to_origin_if_borrowed=True)
                 return updated
         except Exception as exc:
             logger.debug("Failed to sync xAI OAuth entry from auth.json: %s", exc)
@@ -1101,15 +1237,24 @@ class CredentialPool:
                 elif self.provider == "xai-oauth":
                     state = _load_provider_state(auth_store, "xai-oauth")
                     if not isinstance(state, dict):
-                        return
+                        if self._borrowed_from_global_pool:
+                            state = {}
+                        else:
+                            return
                     tokens = state.get("tokens")
                     if not isinstance(tokens, dict):
-                        return
+                        tokens = {}
+                        state["tokens"] = tokens
                     tokens["access_token"] = entry.access_token
                     if entry.refresh_token:
                         tokens["refresh_token"] = entry.refresh_token
                     if entry.last_refresh:
                         state["last_refresh"] = entry.last_refresh
+                    if not state.get("auth_mode"):
+                        state["auth_mode"] = "oauth_device_code"
+                    if self._borrowed_from_global_pool and write_through_to_root:
+                        _write_through_provider_state_to_global_root("xai-oauth", state)
+                        return
                     _store_provider_state(auth_store, "xai-oauth", state, set_active=False)
 
                 else:
@@ -1322,7 +1467,7 @@ class CredentialPool:
                         last_error_reset_at=None,
                     )
                     self._replace_entry(synced, updated)
-                    self._persist()
+                    self._persist(write_to_origin_if_borrowed=True)
                     return updated
                 # Terminal error: auth.json has no newer tokens — the stored
                 # refresh_token is dead.  Clear it from auth.json so the next
@@ -1336,6 +1481,11 @@ class CredentialPool:
                     try:
                         with _auth_store_lock():
                             auth_store = _load_auth_store()
+                            write_root_only = (
+                                self._borrowed_from_global_pool
+                                and auth_mod._global_auth_file_path() is not None
+                                and not _auth_store_has_provider_state(auth_store, "xai-oauth")
+                            )
                             state = _load_provider_state(auth_store, "xai-oauth") or {}
                             if isinstance(state, dict):
                                 tokens = state.get("tokens") or {}
@@ -1354,8 +1504,13 @@ class CredentialPool:
                                             "relogin_required": True,
                                             "at": datetime.now(timezone.utc).isoformat(),
                                         }
-                                        _save_provider_state(auth_store, "xai-oauth", state)
-                                        _save_auth_store(auth_store)
+                                        if write_root_only:
+                                            _write_through_provider_state_to_global_root(
+                                                "xai-oauth", state
+                                            )
+                                        else:
+                                            _save_provider_state(auth_store, "xai-oauth", state)
+                                            _save_auth_store(auth_store)
                     except Exception as clear_exc:
                         logger.debug(
                             "Failed to clear terminal xAI OAuth state: %s", clear_exc
@@ -1370,7 +1525,10 @@ class CredentialPool:
                     ]
                     if self._current_id == entry.id:
                         self._current_id = None
-                    self._persist(removed_ids=removed_ids)
+                    self._persist(
+                        removed_ids=removed_ids,
+                        write_to_origin_if_borrowed=True,
+                    )
                     return None
             # For openai-codex: same race as xAI/nous — another Hermes process
             # may have consumed the refresh token between our proactive sync
@@ -1522,7 +1680,7 @@ class CredentialPool:
             last_error_reset_at=None,
         )
         self._replace_entry(entry, updated)
-        self._persist()
+        self._persist(write_to_origin_if_borrowed=True)
         # Sync refreshed tokens back to auth.json providers so that
         # _seed_from_singletons() on the next load_pool() sees fresh state
         # instead of re-seeding stale/consumed tokens.
@@ -2742,6 +2900,7 @@ def _seed_custom_pool(pool_key: str, entries: List[PooledCredential]) -> Tuple[b
 
 def load_pool(provider: str) -> CredentialPool:
     provider = (provider or "").strip().lower()
+    borrowed_from_global_pool = _pool_entries_borrowed_from_global(provider)
     raw_entries = read_credential_pool(provider)
     disk_ids = {
         entry.get("id")
@@ -2798,9 +2957,22 @@ def load_pool(provider: str) -> CredentialPool:
 
     if changed:
         new_ids = {entry.id for entry in entries}
-        write_credential_pool(
-            provider,
-            [entry.to_dict() for entry in sorted(entries, key=lambda item: item.priority)],
-            removed_ids=disk_ids - new_ids,
-        )
-    return CredentialPool(provider, entries)
+        removed_ids = [entry_id for entry_id in (disk_ids - new_ids) if entry_id]
+        entries_payload = [entry.to_dict() for entry in sorted(entries, key=lambda item: item.priority)]
+        if borrowed_from_global_pool and provider in _ROOT_SHARED_POOL_WRITEBACK_PROVIDERS:
+            _write_through_credential_pool_to_global_root(
+                provider,
+                entries_payload,
+                removed_ids=removed_ids,
+            )
+        else:
+            write_credential_pool(
+                provider,
+                entries_payload,
+                removed_ids=removed_ids,
+            )
+    return CredentialPool(
+        provider,
+        entries,
+        borrowed_from_global_pool=borrowed_from_global_pool,
+    )
