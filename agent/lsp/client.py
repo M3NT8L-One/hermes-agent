@@ -492,15 +492,24 @@ class LSPClient:
             return
         if proc.returncode is None:
             try:
-                proc.terminate()
+                # ``exit`` normally makes an LSP server stop on its own. Give
+                # that clean path a bounded chance before sending SIGTERM.
+                # Besides being gentler, this closes a PID-reuse race where a
+                # server exits between the returncode check and terminate(),
+                # leaving the stale Process object aimed at an unrelated PID.
                 try:
                     await asyncio.wait_for(proc.wait(), timeout=SHUTDOWN_GRACE)
+                    return
                 except asyncio.TimeoutError:
+                    proc.terminate()
                     try:
-                        proc.kill()
-                        await proc.wait()
-                    except ProcessLookupError:
-                        pass
+                        await asyncio.wait_for(proc.wait(), timeout=SHUTDOWN_GRACE)
+                    except asyncio.TimeoutError:
+                        try:
+                            proc.kill()
+                            await proc.wait()
+                        except ProcessLookupError:
+                            pass
             except ProcessLookupError:
                 pass
 

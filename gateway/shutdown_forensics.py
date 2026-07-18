@@ -248,14 +248,38 @@ def spawn_async_diagnostic(
     except OSError:
         return None
 
+    # GNU coreutils `timeout` is not present on macOS and is not a POSIX
+    # utility.  Use the running Python interpreter as the portable watchdog.
+    # It gives the diagnostic shell its own process group and kills that whole
+    # group on expiry, so a wedged ps/pstree child cannot outlive the wrapper.
+    watchdog = r"""
+import os
+import signal
+import subprocess
+import sys
+
+child = subprocess.Popen(["bash", "-c", sys.argv[2]], start_new_session=True)
+try:
+    child.wait(timeout=float(sys.argv[1]))
+except subprocess.TimeoutExpired:
     try:
-        # Detach from our process group so the subprocess survives even
-        # if systemd kills our cgroup with KillMode=control-group (which
-        # would also reap us anyway, but defense in depth).  Without
-        # start_new_session, a SIGKILL on our cgroup takes the diag down
-        # before it can flush.
+        os.killpg(child.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            child.kill()
+        except (ProcessLookupError, OSError):
+            pass
+    try:
+        child.wait(timeout=1)
+    except (subprocess.TimeoutExpired, ChildProcessError):
+        pass
+""".strip()
+
+    try:
+        # Detach from our process group so the watchdog survives long enough
+        # to flush even while the gateway itself is shutting down.
         proc = subprocess.Popen(
-            ["timeout", f"{timeout_seconds:.0f}", "bash", "-c", script],
+            [sys.executable, "-c", watchdog, str(timeout_seconds), script],
             stdout=fd,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
