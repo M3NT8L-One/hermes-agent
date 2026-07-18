@@ -1100,10 +1100,10 @@ def skill_view(
 
         # Collision detection: collect ALL candidates across every dir using
         # every lookup strategy (direct path, recursive by parent dir name,
-        # legacy flat <name>.md). If more than one matches, refuse and tell
-        # the caller — silent shadowing of a local skill by a same-named
-        # external skill is a real bug class (`/skills` shows one, agent
-        # loaded the other) so we surface it loudly instead of guessing.
+        # legacy flat <name>.md). Profile-local skills intentionally have
+        # precedence over external dirs, matching _find_all_skills() and the
+        # documented external-root migration model. Same-priority collisions
+        # still fail closed because there is no unambiguous owner.
         from agent.skill_utils import iter_skill_index_files
 
         candidates: List[Tuple[Optional[Path], Path]] = []  # (skill_dir, skill_md)
@@ -1178,6 +1178,29 @@ def skill_view(
                     found_md
                 ):
                     _record(None, found_md)
+
+        if len(candidates) > 1:
+            local_candidates: List[Tuple[Optional[Path], Path]] = []
+            try:
+                local_root = SKILLS_DIR.resolve()
+            except Exception:
+                local_root = SKILLS_DIR
+            for candidate in candidates:
+                _, candidate_md = candidate
+                try:
+                    candidate_md.resolve().relative_to(local_root)
+                    local_candidates.append(candidate)
+                except Exception:
+                    pass
+            if len(local_candidates) == 1:
+                skill_dir, skill_md = local_candidates[0]
+                logging.getLogger(__name__).info(
+                    "Skill name collision for '%s': using profile-local skill %s over %d external candidate(s)",
+                    name,
+                    skill_md,
+                    len(candidates) - 1,
+                )
+                candidates = [local_candidates[0]]
 
         if len(candidates) > 1:
             paths = [str(smd) for _, smd in candidates]
