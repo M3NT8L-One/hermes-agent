@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 from cli import HermesCLI
 from hermes_cli.browser_connect import (
+    _detach_kwargs,
     _wait_for_browser_debug_ready_or_exit,
     get_chrome_debug_candidates,
     is_browser_debug_ready,
@@ -39,6 +40,17 @@ class _FakeResponse:
 
 
 class TestChromeDebugLaunch:
+    def test_test_owned_browser_stays_in_runner_process_group(self, monkeypatch):
+        monkeypatch.setenv("PYTEST_CURRENT_TEST", "browser cleanup probe")
+
+        assert _detach_kwargs("Darwin") == {}
+        assert _detach_kwargs("Windows") == {}
+
+    def test_normal_browser_launch_remains_detached(self, monkeypatch):
+        monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+
+        assert _detach_kwargs("Darwin") == {"start_new_session": True}
+
     def test_browser_debug_ready_requires_http_cdp_endpoint(self):
         requested = []
 

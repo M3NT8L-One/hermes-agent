@@ -262,6 +262,13 @@ def manual_chrome_debug_command(port: int = DEFAULT_BROWSER_CDP_PORT, system: st
 
 
 def _detach_kwargs(system: str) -> dict:
+    # Browser processes launched from a pytest case belong to that test run.
+    # Keeping them in the pytest process group lets the canonical runner's
+    # post-file group cleanup reap Chrome and its helpers.  In normal Hermes
+    # use the browser remains detached so it survives the short-lived CLI
+    # command that opened it.
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return {}
     if system != "Windows":
         return {"start_new_session": True}
     flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(
