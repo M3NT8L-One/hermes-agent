@@ -20,6 +20,7 @@ from __future__ import annotations
 import os
 import signal
 import subprocess
+import sys
 import types
 
 import pytest
@@ -100,6 +101,23 @@ def test_fail_closed_probe_classifies_raw_builtin_as_unguarded():
     the loaded guard's ``os.kill`` is a plain Python function."""
     assert isinstance(os.getpid, types.BuiltinFunctionType)
     assert not isinstance(os.kill, types.BuiltinFunctionType)
+
+
+@pytest.fixture
+def systemctl_stub(tmp_path, monkeypatch):
+    """Put a harmless systemctl stand-in on PATH for pass-through tests.
+
+    macOS and minimal CI images do not ship systemctl. The point of these
+    tests is that the live-system guard permits read-only commands, not that a
+    developer host happens to run systemd.
+    """
+    if sys.platform == "win32":
+        pytest.skip("POSIX executable stub")
+    stub = tmp_path / "systemctl"
+    stub.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    stub.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ.get('PATH', '')}")
+    return stub
 
 
 # ──────────────────── kill primitives ─────────────────────────
@@ -278,7 +296,7 @@ def test_subprocess_killall_hermes_blocked():
 # ──────────────────── pass-through cases (must NOT raise) ──────
 
 
-def test_systemctl_status_passes_through():
+def test_systemctl_status_passes_through(systemctl_stub):
     """Read-only systemctl probes (status/show/list-units) are fine."""
     # Run with check=False so we don't fail on the gateway's exit code.
     r = subprocess.run(
@@ -290,7 +308,7 @@ def test_systemctl_status_passes_through():
     assert r is not None  # Did not raise — the guard let it through.
 
 
-def test_systemctl_show_passes_through():
+def test_systemctl_show_passes_through(systemctl_stub):
     r = subprocess.run(
         ["systemctl", "--user", "show", "hermes-gateway", "--no-pager"],
         capture_output=True,
@@ -300,7 +318,7 @@ def test_systemctl_show_passes_through():
     assert r is not None
 
 
-def test_systemctl_list_units_passes_through():
+def test_systemctl_list_units_passes_through(systemctl_stub):
     r = subprocess.run(
         ["systemctl", "--user", "list-units", "fake-not-real-unit*", "--no-pager"],
         capture_output=True,
@@ -310,7 +328,7 @@ def test_systemctl_list_units_passes_through():
     assert r is not None
 
 
-def test_systemctl_unrelated_unit_passes_through():
+def test_systemctl_unrelated_unit_passes_through(systemctl_stub):
     """systemctl restart of a non-hermes unit is allowed (we only protect hermes)."""
     # Use --dry-run so we don't actually try to restart anything; just
     # verify the guard doesn't block the call. systemctl supports

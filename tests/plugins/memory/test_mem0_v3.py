@@ -1,6 +1,7 @@
 """Tests for Mem0 v3 API — new tool names, paginated responses, update/delete tools."""
 
 import json
+import threading
 import time
 import pytest
 
@@ -313,19 +314,24 @@ class TestMem0Prefetch:
         assert len([c for c in backend.captured if c[0] == "search"]) == 1
 
     def test_slow_prefetch_returns_quickly(self, monkeypatch):
+        release_search = threading.Event()
+
         class SlowBackend(FakeBackend):
             def search(self, query, *, filters, top_k=10, rerank=True):
-                time.sleep(0.2)
+                assert release_search.wait(timeout=1)
                 return super().search(query, filters=filters, top_k=top_k, rerank=rerank)
 
         monkeypatch.setattr(mem0_plugin, "_PREFETCH_WAIT_SECS", 0.01)
         provider = self._make_provider(
             SlowBackend(search_results=[{"id": "m1", "memory": "lives in Berlin"}])
         )
-        started = time.monotonic()
         assert provider.prefetch("where do I live?") == ""
-        assert time.monotonic() - started < 0.1
-        provider._prefetch_thread.join(timeout=1)
+        # The backend is still blocked, proving prefetch honored its bounded
+        # join without relying on wall-clock scheduling under parallel load.
+        thread = provider._prefetch_thread
+        assert thread is not None and thread.is_alive()
+        release_search.set()
+        thread.join(timeout=1)
         assert "lives in Berlin" in provider.prefetch("where do I live?")
 
     def test_prefetch_empty_results_returns_empty(self):

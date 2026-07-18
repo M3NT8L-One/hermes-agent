@@ -8586,13 +8586,12 @@ class TestMemoryNudgeCounterPersistence:
         import inspect
         from agent.turn_context import build_turn_context as _btc
         src = inspect.getsource(_btc)
-        # The preamble (now in build_turn_context) resets many fields (retry
-        # counts, budget, etc.) before returning. Find that reset block and
-        # verify our counters aren't in it. The reset block ends at
-        # iteration_budget. Anchor exactly on
-        # ``agent.iteration_budget = IterationBudget`` so an unrelated
-        # identifier ending in ``iteration_budget`` can't match the boundary.
-        preamble_end = src.index("agent.iteration_budget = IterationBudget")
+        # Iteration-budget reset now lives behind a helper so delegated goals
+        # can preserve one shared mission budget. That helper call remains the
+        # end of the reset preamble; later nudge handling may legitimately zero
+        # a counter after it fires.
+        reset_call = "_reset_iteration_budget_for_turn(agent)"
+        preamble_end = src.index(reset_call) + len(reset_call)
         preamble = src[:preamble_end]
         assert "agent._turns_since_memory = 0" not in preamble
         assert "agent._iters_since_skill = 0" not in preamble

@@ -8934,9 +8934,9 @@ class TestPtyWebSocket:
         relative_python = Path(".review-venv") / "bin" / Path(sys.executable).name
         python_path = tmp_path / relative_python
         python_path.parent.mkdir(parents=True)
-        # copy2, not os.link: tmp_path may sit on a different filesystem than
-        # the venv (tmpfs /tmp vs disk home) where hard links raise EXDEV.
-        shutil.copy2(sys.executable, python_path)
+        # A hard link to a framework Python binary breaks @rpath lookup on
+        # macOS when the probe executes it from the temporary directory.
+        python_path.symlink_to(sys.executable)
         monkeypatch.setenv("HERMES_CWD", str(tmp_path))
         monkeypatch.setenv("HERMES_PYTHON", str(relative_python))
         monkeypatch.setattr(
@@ -8958,9 +8958,8 @@ class TestPtyWebSocket:
         bin_dir = tmp_path / "bin"
         bin_dir.mkdir()
         executable = bin_dir / command
-        # copy2, not os.link: tmp_path may sit on a different filesystem than
-        # the venv (tmpfs /tmp vs disk home) where hard links raise EXDEV.
-        shutil.copy2(sys.executable, executable)
+        # Preserve the real interpreter location for framework-library lookup.
+        executable.symlink_to(sys.executable)
         env = {
             "HERMES_CWD": str(tmp_path),
             "HERMES_PYTHON": command,

@@ -45,6 +45,20 @@ except ImportError:  # pragma: no cover - non-POSIX
 pytestmark = pytest.mark.skipif(fcntl is None, reason="flock semantics are POSIX-only")
 
 
+@pytest.fixture(autouse=True)
+def _isolated_cron_store(tmp_path: Path):
+    """Pin this file's module-imported cron helpers to a disposable store.
+
+    ``cron.jobs`` resolves its compatibility constants at import time, before
+    pytest's global per-test HERMES_HOME fixture runs.  An explicit context
+    override protects direct single-file pytest invocations as well as the
+    parallel runner, so these regression jobs can never land in live state.
+    """
+    with jobs_mod.use_cron_store(tmp_path):
+        assert jobs_mod._current_cron_store().jobs_file == tmp_path / "cron" / "jobs.json"
+        yield
+
+
 def _hold_jobs_flock(path: Path, release: threading.Event, held: threading.Event):
     """Hold an exclusive flock on *path* from a separate fd until released.
 

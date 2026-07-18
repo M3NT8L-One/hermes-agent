@@ -377,6 +377,21 @@ def _hermetic_environment(tmp_path, monkeypatch):
     (fake_hermes_home / "skills").mkdir()
     monkeypatch.setenv("HERMES_HOME", str(fake_hermes_home))
 
+    # Some platform tests intentionally replace ``os.environ`` with a tiny
+    # mapping via ``patch.dict(..., clear=True)``. That temporarily removes
+    # HERMES_HOME after this fixture has installed it. Gateway identity/status
+    # writes deliberately ignore the context-local profile override, so their
+    # normal fallback would otherwise be the developer's real ~/.hermes.
+    # Pin only that platform-default fallback to this test's disposable home;
+    # explicit HERMES_HOME values still win and production code is unchanged.
+    import gateway.status as _gateway_status
+
+    monkeypatch.setattr(
+        _gateway_status,
+        "_get_platform_default_hermes_home",
+        lambda: fake_hermes_home,
+    )
+
     # 4. Deterministic locale / timezone / hashseed. CI runs in UTC with
     #    C.UTF-8 locale; local dev often doesn't. Pin everything.
     monkeypatch.setenv("TZ", "UTC")

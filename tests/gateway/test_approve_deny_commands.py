@@ -436,6 +436,17 @@ class TestBlockingApprovalE2E:
     def teardown_method(self):
         self._approval_mode_patch.stop()
 
+    @pytest.fixture(autouse=True)
+    def _manual_approval_mode(self, monkeypatch):
+        """Keep manual-flow tests independent of host/provider smart defaults."""
+        from tools import approval as approval_module
+
+        monkeypatch.setattr(
+            approval_module,
+            "_get_approval_config",
+            lambda: {"mode": "manual", "timeout": 60},
+        )
+
     def test_blocking_approval_approve_once(self):
         """check_all_command_guards blocks until resolve_gateway_approval is called."""
         from tools.approval import (

@@ -46,9 +46,31 @@ def test_real_read_tool_binaries_confirm_option_ownership(
 def test_real_binaries_execute_leading_dash_program_payload(
     tmp_path, tool, args, stdin, needs_tty
 ):
-    """A PATH marker proves these binaries do not reparse '-program' as an option."""
+    """A PATH marker proves supported binaries do not reparse '-program' as an option."""
     if shutil.which(tool) is None or (needs_tty and shutil.which("script") is None):
         pytest.skip(f"{tool} or script is not installed")
+
+    if tool == "sort":
+        version = subprocess.run(
+            [tool, "--version"], text=True, capture_output=True, timeout=5
+        )
+        if "Apple" in f"{version.stdout}\n{version.stderr}":
+            pytest.skip("Apple sort does not support this GNU compressor operand contract")
+
+    if tool == "man":
+        help_result = subprocess.run(
+            [tool, "--help"], text=True, capture_output=True, timeout=5
+        )
+        if "--pager" not in f"{help_result.stdout}\n{help_result.stderr}":
+            pytest.skip("installed man does not support the GNU --pager contract")
+
+    if needs_tty:
+        script_version = subprocess.run(
+            ["script", "--version"], text=True, capture_output=True, timeout=5
+        )
+        version_text = f"{script_version.stdout}\n{script_version.stderr}".lower()
+        if script_version.returncode != 0 or "util-linux" not in version_text:
+            pytest.skip("installed script is not the util-linux implementation")
 
     marker = tmp_path / "executed"
     payload = tmp_path / "-payload-marker"
