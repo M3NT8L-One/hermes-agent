@@ -6,7 +6,9 @@ import json
 import logging
 import os
 import posixpath
+import stat
 import sys
+import tempfile
 import threading
 from pathlib import Path, PurePosixPath
 
@@ -604,11 +606,6 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
         f"Refusing to write to sensitive system path: {filepath}\n"
         "Use the terminal tool with sudo if you need to modify system files."
     )
-    for prefix in _SENSITIVE_PATH_PREFIXES:
-        if resolved.startswith(prefix) or normalized.startswith(prefix):
-            return _err
-    if resolved in _SENSITIVE_EXACT_PATHS or normalized in _SENSITIVE_EXACT_PATHS:
-        return _err
     # Prevent agents from modifying the Hermes config file directly.
     # approvals.mode and other security settings live here; a malicious or
     # prompt-injected agent could silently disable exec approval by writing to
@@ -620,6 +617,37 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
             "Agent cannot modify security-sensitive configuration. "
             "Edit ~/.hermes/config.yaml directly or use 'hermes config' instead."
         )
+
+    # macOS places each user's temporary directory below /private/var/folders,
+    # which is otherwise covered by the broad /private/var system guard. Allow
+    # only the current process's real temp root. ``resolved`` has already
+    # dereferenced symlinks, so a temp-path symlink into /etc cannot bypass the
+    # checks below.
+    try:
+        temp_root = os.path.realpath(tempfile.gettempdir()).rstrip(os.sep)
+        temp_parts = Path(temp_root).parts
+        temp_stat = os.stat(temp_root)
+        trusted_macos_temp = (
+            sys.platform == "darwin"
+            and len(temp_parts) == 7
+            and temp_parts[:4] == (os.sep, "private", "var", "folders")
+            and temp_parts[-1] == "T"
+            and stat.S_ISDIR(temp_stat.st_mode)
+            and temp_stat.st_uid == os.getuid()
+        )
+    except (OSError, ValueError):
+        temp_root = ""
+        trusted_macos_temp = False
+    if trusted_macos_temp and (
+        resolved == temp_root or resolved.startswith(temp_root + os.sep)
+    ):
+        return None
+
+    for prefix in _SENSITIVE_PATH_PREFIXES:
+        if resolved.startswith(prefix) or normalized.startswith(prefix):
+            return _err
+    if resolved in _SENSITIVE_EXACT_PATHS or normalized in _SENSITIVE_EXACT_PATHS:
+        return _err
     return None
 
 

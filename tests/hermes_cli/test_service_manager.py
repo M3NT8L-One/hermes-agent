@@ -7,6 +7,8 @@ implementation in this same file once that phase ships.
 """
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from hermes_cli.service_manager import (
@@ -436,16 +438,23 @@ def test_s6_manager_kind_and_supports_registration() -> None:
 # tests/docker/test_s6_profile_gateway_integration.py.
 
 
-def test_seed_supervise_skeleton_creates_expected_layout(tmp_path) -> None:
+def test_seed_supervise_skeleton_creates_expected_layout(tmp_path, monkeypatch) -> None:
     """Verifies the dirs + FIFO + modes the helper lays down."""
     import stat
 
-    from hermes_cli.service_manager import _seed_supervise_skeleton
+    import hermes_cli.service_manager as service_manager
+
+    # The production helper runs as root and chowns to hermes before chmod.
+    # An unprivileged macOS test process cannot set setgid for the container's
+    # gid 10000, so use the current process identity for the layout unit test.
+    # The real 10000:10000 ownership contract is covered in Docker integration.
+    monkeypatch.setattr(service_manager, "_HERMES_UID", os.getuid())
+    monkeypatch.setattr(service_manager, "_HERMES_GID", os.getgid())
 
     svc_dir = tmp_path / "gateway-foo"
     svc_dir.mkdir()
 
-    _seed_supervise_skeleton(svc_dir)
+    service_manager._seed_supervise_skeleton(svc_dir)
 
     # Top-level event/ — s6-svlisten1 event subscription dir.
     event = svc_dir / "event"
@@ -473,7 +482,7 @@ def test_seed_supervise_skeleton_creates_expected_layout(tmp_path) -> None:
     assert stat.S_IMODE(control.stat().st_mode) == 0o660
 
 
-def test_seed_supervise_skeleton_handles_log_subservice(tmp_path) -> None:
+def test_seed_supervise_skeleton_handles_log_subservice(tmp_path, monkeypatch) -> None:
     """When a log/ subdir exists, its supervise tree also gets seeded.
 
     Without this, ``unregister_profile_gateway``'s rmtree would EACCES
@@ -482,13 +491,16 @@ def test_seed_supervise_skeleton_handles_log_subservice(tmp_path) -> None:
     """
     import stat
 
-    from hermes_cli.service_manager import _seed_supervise_skeleton
+    import hermes_cli.service_manager as service_manager
+
+    monkeypatch.setattr(service_manager, "_HERMES_UID", os.getuid())
+    monkeypatch.setattr(service_manager, "_HERMES_GID", os.getgid())
 
     svc_dir = tmp_path / "gateway-foo"
     svc_dir.mkdir()
     (svc_dir / "log").mkdir()  # logger subdir present
 
-    _seed_supervise_skeleton(svc_dir)
+    service_manager._seed_supervise_skeleton(svc_dir)
 
     # Logger's own supervise tree is seeded the same way.
     log_event = svc_dir / "log" / "event"
