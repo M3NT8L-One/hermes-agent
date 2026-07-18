@@ -49,6 +49,52 @@ class TestDetectCodeSkew:
         code_skew.record_boot_fingerprint()  # must not overwrite the boot snapshot
         assert code_skew._boot_fingerprint == "git:refs/heads/main:first"
 
+    def test_source_revision_status_reports_matching_boot_and_disk(self, monkeypatch):
+        monkeypatch.setattr(
+            code_skew,
+            "_fingerprint",
+            lambda: "git:refs/heads/main:abc1234567890",
+        )
+        code_skew.record_boot_fingerprint()
+
+        assert code_skew.source_revision_status() == {
+            "boot_revision": "abc1234567",
+            "disk_revision": "abc1234567",
+            "code_skew": False,
+        }
+
+    def test_source_revision_status_reports_drift(self, monkeypatch):
+        monkeypatch.setattr(
+            code_skew,
+            "_fingerprint",
+            lambda: "git:refs/heads/main:abc1234567890",
+        )
+        code_skew.record_boot_fingerprint()
+        monkeypatch.setattr(
+            code_skew,
+            "_fingerprint",
+            lambda: "git:refs/heads/main:def4567890123",
+        )
+
+        assert code_skew.source_revision_status() == {
+            "boot_revision": "abc1234567",
+            "disk_revision": "def4567890",
+            "code_skew": True,
+        }
+
+    def test_source_revision_status_is_unknown_without_boot_snapshot(self, monkeypatch):
+        monkeypatch.setattr(
+            code_skew,
+            "_fingerprint",
+            lambda: "git:refs/heads/main:abc1234567890",
+        )
+
+        assert code_skew.source_revision_status() == {
+            "boot_revision": None,
+            "disk_revision": "abc1234567",
+            "code_skew": None,
+        }
+
 
 class TestShort:
     def test_shortens_long_sha(self):
