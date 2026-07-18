@@ -72,22 +72,24 @@ class TestIgnoreUserConfigEnvGate:
         return cli.load_cli_config
 
     def test_user_config_loaded_when_flag_unset(self, tmp_path, monkeypatch):
-        self._write_user_config(tmp_path, "test-vendor/ignore-user-config-sentinel")
+        user_model_default = "test-vendor/ignore-user-config-sentinel"
+        self._write_user_config(tmp_path, user_model_default)
         load_cli_config = self._reload_cli(monkeypatch, tmp_path)
 
         cfg = load_cli_config()
 
         # User config value wins
-        assert cfg["model"]["default"] == "test-vendor/ignore-user-config-sentinel"
+        assert cfg["model"]["default"] == user_model_default
         assert cfg["agent"]["system_prompt"] == "from user config"
 
     def test_user_config_skipped_when_flag_set(self, tmp_path, monkeypatch):
         """With HERMES_IGNORE_USER_CONFIG=1, user config.yaml is ignored.
 
-        The built-in default ``model.default`` is empty string (no user override),
-        and the user's ``agent.system_prompt`` is not seen.
+        The user's ``model.default`` and ``agent.system_prompt`` are not seen,
+        even if built-in/project defaults later happen to use a real model name.
         """
-        self._write_user_config(tmp_path, "test-vendor/ignore-user-config-sentinel")
+        user_model_default = "test-vendor/ignore-user-config-sentinel"
+        self._write_user_config(tmp_path, user_model_default)
         monkeypatch.setenv("HERMES_IGNORE_USER_CONFIG", "1")
 
         load_cli_config = self._reload_cli(monkeypatch, tmp_path)
@@ -96,21 +98,22 @@ class TestIgnoreUserConfigEnvGate:
         # User-set "system_prompt: from user config" MUST NOT leak through
         assert cfg["agent"].get("system_prompt", "") != "from user config"
 
-        # User-set model.default MUST NOT leak through — either the built-in
-        # default ("" or unset) or a project-level fallback, but never the
-        # user's value
-        assert cfg["model"].get("default", "") != "test-vendor/ignore-user-config-sentinel"
+        # User-set model.default MUST NOT leak through. Use a sentinel rather
+        # than a plausible default model name so this test stays invariant-safe
+        # when built-in/project defaults evolve.
+        assert cfg["model"].get("default", "") != user_model_default
 
     def test_flag_ignored_when_set_to_other_value(self, tmp_path, monkeypatch):
         """Only the literal value "1" activates the bypass, matching the yolo pattern."""
-        self._write_user_config(tmp_path, "test-vendor/ignore-user-config-sentinel")
+        user_model_default = "test-vendor/ignore-user-config-sentinel"
+        self._write_user_config(tmp_path, user_model_default)
         monkeypatch.setenv("HERMES_IGNORE_USER_CONFIG", "true")  # not "1"
 
         load_cli_config = self._reload_cli(monkeypatch, tmp_path)
         cfg = load_cli_config()
 
         # "true" != "1", so user config IS loaded
-        assert cfg["model"]["default"] == "test-vendor/ignore-user-config-sentinel"
+        assert cfg["model"]["default"] == user_model_default
 
 
 class TestIgnoreRulesEnvGate:

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import sys
 import textwrap
@@ -233,6 +234,25 @@ def test_bare_q_flag_passes_through(tmp_path: Path) -> None:
     assert "unrecognized arguments" not in proc.stdout
 
 
+def test_help_exits_without_discovering_or_running_tests() -> None:
+    """Runner help is a runner option, not a pytest flag for every file."""
+    repo_root = Path(__file__).resolve().parent.parent
+    runner = repo_root / "scripts" / "run_tests_parallel.py"
+
+    proc = subprocess.run(
+        [sys.executable, str(runner), "--help"],
+        cwd=repo_root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=10,
+    )
+
+    assert proc.returncode == 0, proc.stdout
+    assert "usage:" in proc.stdout.lower()
+    assert "Discovered" not in proc.stdout
+
+
 def test_bare_value_flag_keeps_its_value(tmp_path: Path) -> None:
     """``-k test_alpha`` reaches pytest as a selector, not as a path.
 
@@ -359,3 +379,79 @@ def test_file_retry_does_not_launder_deterministic_failure(tmp_path: Path) -> No
     assert proc.returncode == 1, proc.stdout
     assert "deterministic regression" in proc.stdout
     assert "FLAKY file" not in proc.stdout
+
+
+def test_module_import_gets_isolated_hermes_home(tmp_path: Path) -> None:
+    """Import-time config readers must not see the developer's live home.
+
+    Pytest imports a test module before autouse fixtures run, so this boundary
+    belongs in the per-file runner rather than only in tests/conftest.py.
+    """
+    probe_dir = tmp_path / "probe-home"
+    probe_dir.mkdir()
+    inherited_home = os.environ.get("HERMES_HOME", "")
+    (probe_dir / "test_homeprobe.py").write_text(
+        "import os\n"
+        "from pathlib import Path\n"
+        f"INHERITED = {inherited_home!r}\n"
+        "MODULE_HOME = os.environ.get('HERMES_HOME', '')\n"
+        "assert MODULE_HOME\n"
+        "assert Path(MODULE_HOME).is_dir()\n"
+        "assert MODULE_HOME != INHERITED\n\n"
+        "def test_import_home_is_still_available():\n"
+        "    assert MODULE_HOME\n"
+    )
+
+    proc = _run_runner(probe_dir, "-q")
+    assert proc.returncode == 0, proc.stdout
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX SIGINT process-group invariant")
+def test_interrupt_terminates_active_per_file_process(tmp_path: Path) -> None:
+    probe_dir = tmp_path / "probe-interrupt"
+    probe_dir.mkdir()
+    pid_file = tmp_path / "child.pid"
+    (probe_dir / "test_hang.py").write_text(
+        "import os\n"
+        "import time\n"
+        "from pathlib import Path\n"
+        f"Path({str(pid_file)!r}).write_text(str(os.getpid()))\n\n"
+        "def test_hang():\n"
+        "    time.sleep(60)\n"
+    )
+    repo_root = Path(__file__).resolve().parent.parent
+    runner = repo_root / "scripts" / "run_tests_parallel.py"
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            str(runner),
+            "--paths",
+            str(probe_dir),
+            "-j",
+            "1",
+            "--file-timeout",
+            "90",
+        ],
+        cwd=repo_root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    deadline = time.monotonic() + 10
+    while not pid_file.exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert pid_file.exists(), "probe pytest process did not start"
+    child_pid = int(pid_file.read_text())
+
+    proc.send_signal(signal.SIGINT)
+    output, _ = proc.communicate(timeout=15)
+
+    assert proc.returncode == 130, output
+    assert "terminated active per-file process groups" in output
+    child_status = subprocess.run(
+        ["ps", "-p", str(child_pid)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    assert child_status.returncode != 0

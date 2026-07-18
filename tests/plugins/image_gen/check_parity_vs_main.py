@@ -177,6 +177,8 @@ def _run_scenario(repo_path: Path, label: str, config_yaml: str, env: dict) -> d
     if not venv_python.exists():
         venv_python = MAIN_DIR / ".venv" / "bin" / "python"
     if not venv_python.exists():
+        venv_python = MAIN_DIR / "venv" / "bin" / "python"
+    if not venv_python.exists():
         venv_python = Path("python3")
 
     out = subprocess.run(

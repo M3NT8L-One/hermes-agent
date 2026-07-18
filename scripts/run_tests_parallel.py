@@ -44,6 +44,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, Future
@@ -53,6 +54,10 @@ from typing import Dict, List, Tuple
 
 # Default test discovery roots.
 _DEFAULT_ROOTS = ["tests"]
+
+_ACTIVE_PROCESS_LOCK = threading.Lock()
+_ACTIVE_PROCESSES: Dict[int, Tuple["subprocess.Popen", int | None]] = {}
+_INTERRUPTED = threading.Event()
 
 # Directories to skip during discovery — these suites require real
 # external services (a model gateway, a docker daemon with a prebuilt
@@ -228,6 +233,24 @@ def _kill_tree(proc: "subprocess.Popen", pgid: int | None = None) -> None:
         pass
 
 
+def _register_active_process(proc: "subprocess.Popen", pgid: int | None) -> None:
+    with _ACTIVE_PROCESS_LOCK:
+        _ACTIVE_PROCESSES[proc.pid] = (proc, pgid)
+
+
+def _unregister_active_process(proc: "subprocess.Popen") -> None:
+    with _ACTIVE_PROCESS_LOCK:
+        _ACTIVE_PROCESSES.pop(proc.pid, None)
+
+
+def _kill_all_active_processes() -> None:
+    """Terminate every per-file process group after a runner interrupt."""
+    with _ACTIVE_PROCESS_LOCK:
+        active = list(_ACTIVE_PROCESSES.values())
+    for proc, pgid in active:
+        _kill_tree(proc, pgid=pgid)
+
+
 def _run_one_file(
     file: Path,
     pytest_args: List[str],
@@ -267,11 +290,14 @@ def _run_one_file(
     orphan onto PID 1. This outer timeout exists only to
     bound a pathologically slow or hung file as a whole.
     """
+    if _INTERRUPTED.is_set():
+        return file, 130, "runner interrupted before file launch", {}, 0.0
+
     file, rc, output, summary, subproc_wall = _run_one_file_once(
         file, pytest_args, repo_root, file_timeout
     )
     attempt = 0
-    while rc != 0 and attempt < retries:
+    while rc != 0 and attempt < retries and not _INTERRUPTED.is_set():
         attempt += 1
         first_output = output
         file, rc, output, summary, subproc_wall2 = _run_one_file_once(
@@ -306,59 +332,91 @@ def _run_one_file_once(
 ) -> Tuple[Path, int, str, dict[str, int], float]:
     """Single attempt of a per-file pytest subprocess (see _run_one_file)."""
     cmd = [sys.executable, "-m", "pytest", str(file), *pytest_args]
-    
+
+    # Isolate HERMES_HOME before pytest imports the test module.  The autouse
+    # fixture in tests/conftest.py replaces HERMES_HOME per test, but pytest
+    # imports modules before fixtures run.  Without this earlier boundary,
+    # import-time config readers can freeze the developer's live approvals,
+    # model routes, cwd, or auth state into a supposedly hermetic test file.
+    # Keep HOME itself stable: package managers and subprocess fixtures rely on
+    # it, and Hermes state is required to use HERMES_HOME anyway.
+    hermes_home_ctx = tempfile.TemporaryDirectory(prefix="hermes-pytest-")
+    hermes_home = Path(hermes_home_ctx.name)
+    for child in ("sessions", "cron", "memories", "skills"):
+        (hermes_home / child).mkdir()
+
     subproc_start = time.monotonic()
-    # launch the pytest process
-    proc = subprocess.Popen(
-        cmd,
-        cwd=repo_root,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True, encoding="utf-8", errors="replace",
-        env=os.environ,
-        # POSIX: place the child at the head of its own process group so
-        # _kill_tree can SIGKILL the group atomically.
-        # Windows: this maps to CREATE_NEW_PROCESS_GROUP in CPython 3.12+;
-        # _kill_tree handles the Windows path via taskkill /F /T.
-        start_new_session=True,
-    )
-
-    # Capture the pgid NOW, before the leader can exit and be reaped. Once
-    # the leader is reaped, os.getpgid(proc.pid) raises ProcessLookupError
-    # even though grandchildren in that group are still alive — defeating
-    # the whole cleanup. None on Windows where the pgid concept doesn't apply.
-    pgid: int | None = None
-    if sys.platform != "win32":
-        try:
-            pgid = os.getpgid(proc.pid)
-        except (ProcessLookupError, PermissionError):
-            pgid = None
-
+    proc: subprocess.Popen | None = None
     try:
-        output, _ = proc.communicate(timeout=file_timeout)
-        rc = proc.returncode
-    except subprocess.TimeoutExpired:
-        _kill_tree(proc, pgid=pgid)
-        try:
-            output, _ = proc.communicate(timeout=10)
-        except subprocess.TimeoutExpired:
-            output = "(file timeout exceeded; output unavailable)"
-        rc = 124  # de facto convention for "killed by timeout".
-        output = (
-            f"({file_timeout:.0f}s exceeded; "
-            f"process tree SIGKILL'd)\n{output}"
+        # launch the pytest process
+        proc = subprocess.Popen(
+            cmd,
+            cwd=repo_root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            # skipping writing bytecode because we're running a bunch of parallel python processes on the same code
+            env={
+                **os.environ,
+                "PYTHONDONTWRITEBYTECODE": "1",
+                "HERMES_HOME": str(hermes_home),
+            },
+            # POSIX: place the child at the head of its own process group so
+            # _kill_tree can SIGKILL the group atomically.
+            # Windows: this maps to CREATE_NEW_PROCESS_GROUP in CPython 3.12+;
+            # _kill_tree handles the Windows path via taskkill /F /T.
+            start_new_session=True,
         )
-    except BaseException:
-        # KeyboardInterrupt / runner crash — make sure no zombie
-        # grandchildren outlive us.
-        _kill_tree(proc, pgid=pgid)
-        raise
-    else:
-        # Happy path: pytest exited on its own. Kill the group anyway in
-        # case it left grandchildren behind; already-dead is a no-op.
-        _kill_tree(proc, pgid=pgid)
 
-        output +=  "\n"
+        # Capture the pgid NOW, before the leader can exit and be reaped. Once
+        # the leader is reaped, os.getpgid(proc.pid) raises ProcessLookupError
+        # even though grandchildren in that group are still alive — defeating
+        # the whole cleanup. None on Windows where the pgid concept doesn't apply.
+        pgid: int | None = None
+        if sys.platform != "win32":
+            try:
+                pgid = os.getpgid(proc.pid)
+            except (ProcessLookupError, PermissionError):
+                pgid = None
+        _register_active_process(proc, pgid)
+
+        try:
+            output, _ = proc.communicate(timeout=file_timeout)
+            rc = proc.returncode
+        except subprocess.TimeoutExpired:
+            _kill_tree(proc, pgid=pgid)
+            try:
+                output, _ = proc.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                output = "(file timeout exceeded; output unavailable)"
+            rc = 124  # de facto convention for "killed by timeout".
+            output = (
+                f"({file_timeout:.0f}s exceeded; "
+                f"process tree SIGKILL'd)\n{output}"
+            )
+        except BaseException:
+            # KeyboardInterrupt / runner crash — make sure no zombie
+            # grandchildren outlive us.
+            _kill_tree(proc, pgid=pgid)
+            raise
+        else:
+            # Happy path: pytest exited on its own. Kill the group anyway in
+            # case it left grandchildren behind; already-dead is a no-op.
+            _kill_tree(proc, pgid=pgid)
+
+            output += "\n"
+    finally:
+        if proc is not None:
+            _unregister_active_process(proc)
+        try:
+            hermes_home_ctx.cleanup()
+        except OSError:
+            # A crashing test may leave a deliberately unreadable fixture
+            # behind. The OS temp cleaner can remove it later; runner cleanup
+            # must not hide the actual pytest result.
+            pass
 
     if rc == 5:
         # No tests collected — every test in the file was filtered out.
@@ -751,7 +809,7 @@ def main() -> int:
     # it never reaches our positional ``paths``. ``=``-joined forms
     # (``-k=expr``, ``--tb=long``) are self-contained and need no lookahead.
     OUR_FLAGS = {
-        "-j", "--jobs", "--paths", "--include-integration",
+        "-h", "--help", "-j", "--jobs", "--paths", "--include-integration",
         "--file-timeout", "--file-retries", "--slice", "--generate-slices", "--files",
     }
     # pytest short flags that consume the NEXT token as their value.
@@ -938,7 +996,10 @@ def main() -> int:
             if rc != 0:
                 _print_inline_failure(fpath, output, repo_root, pytest_passthrough)
 
-    with ThreadPoolExecutor(max_workers=args.jobs) as pool:
+    _INTERRUPTED.clear()
+    pool = ThreadPoolExecutor(max_workers=args.jobs)
+    interrupted = False
+    try:
         futures: List[Future] = []
         for file in files:
             t0 = time.monotonic()
@@ -953,6 +1014,18 @@ def main() -> int:
         # control flow obvious.
         for fut in futures:
             fut.result() if fut.exception() is None else None
+    except KeyboardInterrupt:
+        interrupted = True
+        _INTERRUPTED.set()
+        for fut in futures:
+            fut.cancel()
+        _kill_all_active_processes()
+        pool.shutdown(wait=False, cancel_futures=True)
+        print("\nInterrupted; terminated active per-file process groups.", file=sys.stderr)
+        return 130
+    finally:
+        if not interrupted:
+            pool.shutdown(wait=True)
 
     elapsed = time.monotonic() - started
     print()
