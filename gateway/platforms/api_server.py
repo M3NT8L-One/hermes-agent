@@ -6046,6 +6046,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "timestamp": ts,
                     "tool": tool_name,
                     "preview": preview,
+                    "args": args,
                 })
             elif event_type == "tool.completed":
                 _push({

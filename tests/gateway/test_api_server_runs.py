@@ -122,6 +122,25 @@ def auth_adapter():
         instance._close_owned_resources()
 
 
+@pytest.mark.asyncio
+async def test_run_tool_started_event_preserves_structured_arguments(adapter):
+    run_id = "run_tool_args"
+    adapter._run_statuses[run_id] = {"status": "running"}
+    adapter._run_streams[run_id] = asyncio.Queue()
+    callback = adapter._make_run_event_callback(run_id, asyncio.get_running_loop())
+
+    callback(
+        "tool.started",
+        tool_name="read_file",
+        preview="Inspecting a project file",
+        args={"path": "/workspace/Models.swift"},
+    )
+    event = await asyncio.wait_for(adapter._run_streams[run_id].get(), timeout=1)
+
+    assert event["event"] == "tool.started"
+    assert event["args"] == {"path": "/workspace/Models.swift"}
+
+
 # ---------------------------------------------------------------------------
 # POST /v1/runs — start a run
 # ---------------------------------------------------------------------------
