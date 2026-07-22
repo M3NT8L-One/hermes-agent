@@ -859,6 +859,25 @@ def _approval_key_aliases(pattern_key: str) -> set[str]:
     return _PATTERN_KEY_ALIASES.get(pattern_key, {pattern_key})
 
 
+_DELEGATED_INLINE_SCRIPT_DESCRIPTIONS = {
+    "script execution via -e/-c flag",
+    "script execution via heredoc",
+}
+
+
+def _delegated_worker_denial_message(description: str) -> str:
+    message = (
+        "BLOCKED: delegated worker policy denied a dangerous "
+        f"command ({description})."
+    )
+    if description in _DELEGATED_INLINE_SCRIPT_DESCRIPTIONS:
+        message += (
+            " Do not retry in another inline form. Use write_file to create a "
+            "scratch script, then execute that file by absolute path."
+        )
+    return message
+
+
 # =========================================================================
 # Detection
 # =========================================================================
@@ -3339,10 +3358,7 @@ def check_all_command_guards(command: str, env_type: str,
                 }
             return {
                 "approved": False,
-                "message": (
-                    "BLOCKED: delegated worker policy denied a dangerous "
-                    f"command ({description})."
-                ),
+                "message": _delegated_worker_denial_message(description),
                 "description": description,
             }
 
