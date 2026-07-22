@@ -250,6 +250,13 @@ class TestChildSystemPrompt(unittest.TestCase):
         prompt = _build_child_system_prompt("Do something", "  ")
         self.assertNotIn("CONTEXT", prompt)
 
+    def test_prompt_explains_delegated_terminal_script_policy(self):
+        prompt = _build_child_system_prompt("Inspect the repository")
+        self.assertIn("python -c", prompt)
+        self.assertIn("interpreter heredocs", prompt)
+        self.assertIn("write_file", prompt)
+        self.assertIn("absolute path", prompt)
+
 
 class TestStripBlockedTools(unittest.TestCase):
     def test_removes_blocked_toolsets(self):

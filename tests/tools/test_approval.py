@@ -175,6 +175,29 @@ class TestDelegatedCapabilityGuardIntegration:
         assert result["approved"] is False
         assert len(calls) == 1
 
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "python3 -c 'print(1)'",
+            "python3 <<'PY'\nprint(1)\nPY",
+        ],
+    )
+    def test_worker_inline_script_denial_includes_recovery_guidance(self, command):
+        def deny(command, description, **kwargs):
+            return "deny"
+
+        setattr(deny, "_hermes_noninteractive_worker_policy", True)
+        result = approval_module.check_all_command_guards(
+            command,
+            "local",
+            approval_callback=deny,
+        )
+
+        assert result["approved"] is False
+        assert "Do not retry" in result["message"]
+        assert "write_file" in result["message"]
+        assert "absolute path" in result["message"]
+
     def test_worker_policy_precedes_yolo_and_permanent_approvals(self):
         calls = []
 
