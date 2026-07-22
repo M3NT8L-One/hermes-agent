@@ -1958,7 +1958,7 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
         f"{cwd_note}\n\n"
         "Print your final result to stdout. Use Python stdlib (json, re, math, csv, "
         "datetime, collections, etc.) for processing between tool calls.\n\n"
-        "Also available (no import needed — built into hermes_tools):\n"
+        "Also available via `from hermes_tools import json_parse, shell_quote, retry`:\n"
         "  json_parse(text: str) — json.loads with strict=False; use for terminal() output with control chars\n"
         "  shell_quote(s: str) — shlex.quote(); use when interpolating dynamic strings into shell commands\n"
         "  retry(fn, max_attempts=3, delay=2) — retry with exponential backoff for transient failures"
