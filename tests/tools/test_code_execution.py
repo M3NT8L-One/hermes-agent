@@ -79,6 +79,14 @@ class TestSandboxRequirements(unittest.TestCase):
         self.assertIn("code", EXECUTE_CODE_SCHEMA["parameters"]["properties"])
         self.assertIn("code", EXECUTE_CODE_SCHEMA["parameters"]["required"])
 
+    def test_schema_documents_convenience_helper_imports(self):
+        description = EXECUTE_CODE_SCHEMA["description"]
+        self.assertIn(
+            "from hermes_tools import json_parse, shell_quote, retry",
+            description,
+        )
+        self.assertNotIn("no import needed", description)
+
 
 class TestHermesToolsGeneration(unittest.TestCase):
     def test_generates_all_allowed_tools(self):
