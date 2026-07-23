@@ -548,9 +548,19 @@ class TestBoundedArtifacts:
         hermes_home = tmp_path / "profile-home"
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
         db.create_session("s_discover_big", source="cli")
-        huge = "boundedneedle " + ("discover-evidence " * _MAX_INLINE_RESULT_BYTES)
-        anchor = db.append_message("s_discover_big", role="user", content=huge)
-        db.append_message("s_discover_big", role="assistant", content="resolution")
+        # Discovery now bounds each message before this response-level guard.
+        # Fill the complete ±5-message window so the aggregate result still
+        # crosses the artifact threshold and exercises this second boundary.
+        anchor = None
+        for index in range(11):
+            prefix = "boundedneedle " if index == 5 else ""
+            message_id = db.append_message(
+                "s_discover_big",
+                role="user" if index % 2 == 0 else "assistant",
+                content=f"{prefix}discover-{index} " + ("evidence " * 1000),
+            )
+            if index == 5:
+                anchor = message_id
         db._conn.commit()
 
         rendered = session_search(query="boundedneedle", limit=1, db=db)
@@ -566,7 +576,13 @@ class TestBoundedArtifacts:
                 "window": 5,
             }
         ]
-        assert full["results"][0]["messages"][0]["content"] == huge
+        full_anchor = next(
+            message
+            for message in full["results"][0]["messages"]
+            if message["id"] == anchor
+        )
+        assert full_anchor["content"].startswith("boundedneedle discover-5")
+        assert len(full_anchor["content"]) > 600
 
     def test_oversized_read_writes_full_artifact_and_returns_anchor(
         self, db, tmp_path, monkeypatch
