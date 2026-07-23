@@ -353,10 +353,8 @@ def check_for_updates() -> Optional[int]:
             cache_identity = {"mode": "package"}
 
     # Read cache — invalidate if the source identity or installed version has
-    # changed since the last check. The version guard matters for pip installs:
-    # `check_via_pypi()` compares against VERSION, so a `pip install --upgrade`
-    # changes VERSION but leaves rev unchanged (both None), and without this
-    # the stale "behind" count would survive the upgrade for up to 6h. See #34491.
+    # changed since the last check. The version guard ensures a package upgrade
+    # cannot reuse an update result written by an older installed version.
     now = time.time()
     try:
         if cache_file.exists():
@@ -376,7 +374,9 @@ def check_for_updates() -> Optional[int]:
     if embedded_rev:
         behind = _check_via_rev(embedded_rev)
     elif repo_dir is None:
-        behind = check_via_pypi()
+        # No source checkout and no embedded revision means there is no trusted
+        # Git identity to compare. Package installs intentionally stay silent.
+        behind = None
     else:
         behind = _check_via_local_git(repo_dir)
         # The check fetches the canonical remote and may move its tracking ref;
