@@ -231,7 +231,12 @@ class TestStreamInterruptBeforeRetry:
 
         agent = _make_agent()
         agent._interrupt_requested = False
-        mock_replace.side_effect = lambda **_kwargs: stale_attempt_cancelled.set()
+        # The stale watchdog intentionally stopped replacing the shared OpenAI
+        # client in #70773: closing that pool from the poll thread can recycle
+        # file descriptors while the stream worker is still unwinding.  Use the
+        # request-local abort as the synchronization point instead; that is the
+        # transport the watchdog still owns and closes before retrying.
+        mock_abort.side_effect = lambda *_args, **_kwargs: stale_attempt_cancelled.set()
         deltas = []
         agent.stream_delta_callback = deltas.append
 
