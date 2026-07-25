@@ -3256,7 +3256,7 @@ def test_connect_falls_back_to_delete_on_locking_protocol(tmp_path, monkeypatch,
     import sqlite3 as _sqlite3
     from unittest.mock import patch as _patch
 
-    import hermes_state as _hs
+    import hermes_state as hs
 
     # The fallback warning is deduped process-globally ("once per process per
     # database" — _log_wal_fallback_once / _log_wal_reset_bug_once). Any earlier
@@ -3264,13 +3264,17 @@ def test_connect_falls_back_to_delete_on_locking_protocol(tmp_path, monkeypatch,
     # for that label, so without clearing it this test sees zero warnings and
     # fails only when run as part of the file (it passes in isolation). Clear
     # both dedup sets so the warning is emitted for this connect().
-    _hs._wal_fallback_warned_paths.clear()
-    _hs._wal_reset_bug_warned_paths.clear()
 
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    # This test targets the NFS/SMB locking-protocol path specifically. A
+    # vulnerable linked SQLite now takes the separate WAL-reset safety path
+    # before attempting WAL, so make that independent precondition explicit.
+    monkeypatch.setattr(hs, "is_sqlite_wal_reset_vulnerable", lambda: False)
+    monkeypatch.setattr(hs, "_wal_fallback_warned_paths", set())
+    monkeypatch.setattr(hs, "_wal_reset_bug_warned_paths", set())
 
     # Clear module cache so a fresh connect() is attempted
     kb._INITIALIZED_PATHS.clear()
