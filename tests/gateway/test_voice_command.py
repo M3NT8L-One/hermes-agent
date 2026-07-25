@@ -1769,6 +1769,19 @@ class TestAutoTtsEmptyTextGuard:
 class TestStreamTtsToSpeaker:
     """Functional tests for the streaming TTS pipeline."""
 
+    @pytest.fixture(autouse=True)
+    def isolate_tts_provider_and_playback(self, monkeypatch):
+        """Keep functional queue tests away from live providers and speakers."""
+        monkeypatch.setattr("tools.tts_tool._load_tts_config", lambda: {})
+        monkeypatch.setattr(
+            "tools.tts_streaming.resolve_streaming_provider",
+            lambda *_args, **_kwargs: None,
+        )
+        monkeypatch.setattr(
+            "tools.tts_tool.text_to_speech_tool",
+            lambda **_kwargs: None,
+        )
+
     def test_none_sentinel_flushes_buffer(self):
         """None sentinel causes remaining buffer to be spoken."""
         from tools.tts_tool import stream_tts_to_speaker

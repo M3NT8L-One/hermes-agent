@@ -8,8 +8,20 @@ always either a bug or prompt-injection-controlled
 """
 
 import json
+from pathlib import Path
 
 from tools.tts_tool import text_to_speech_tool
+
+
+def _stub_edge_backend(monkeypatch):
+    """Exercise the path guard without making a real synthesis request."""
+
+    async def generate(_text, output_path, _config):
+        Path(output_path).write_bytes(b"test-audio")
+
+    monkeypatch.setattr("tools.tts_tool._load_tts_config", lambda: {})
+    monkeypatch.setattr("tools.tts_tool._import_edge_tts", lambda: object())
+    monkeypatch.setattr("tools.tts_tool._generate_edge_tts", generate)
 
 
 def test_output_path_rejects_traversal_escape():
@@ -40,6 +52,7 @@ def test_output_path_absolute_path_passes_guard(tmp_path, monkeypatch):
     provider configured, etc.) is fine — the assertion is specifically
     that the 'traversal' rejection didn't fire.
     """
+    _stub_edge_backend(monkeypatch)
     inside = tmp_path / "clip.mp3"
     result = json.loads(text_to_speech_tool(
         text="hello",
@@ -51,6 +64,7 @@ def test_output_path_absolute_path_passes_guard(tmp_path, monkeypatch):
 
 def test_output_path_relative_no_dotdot_passes_guard(tmp_path, monkeypatch):
     """Relative paths without '..' components must pass the guard."""
+    _stub_edge_backend(monkeypatch)
     monkeypatch.chdir(tmp_path)
     result = json.loads(text_to_speech_tool(
         text="hello",
