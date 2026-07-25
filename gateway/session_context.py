@@ -119,6 +119,11 @@ _SESSION_ASYNC_DELIVERY: ContextVar = ContextVar("HERMES_SESSION_ASYNC_DELIVERY"
 _CRON_AUTO_DELIVER_PLATFORM: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_PLATFORM", default=_UNSET)
 _CRON_AUTO_DELIVER_CHAT_ID: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_CHAT_ID", default=_UNSET)
 _CRON_AUTO_DELIVER_THREAD_ID: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_THREAD_ID", default=_UNSET)
+# Approval/runtime classification for the currently executing cron job. This is
+# context-local because the embedded scheduler shares one process with live
+# gateway conversations; a process-global env marker would classify every
+# later conversation as cron after the first scheduled run.
+_CRON_SESSION: ContextVar = ContextVar("HERMES_CRON_SESSION", default=_UNSET)
 
 _VAR_MAP = {
     "HERMES_SESSION_PLATFORM": _SESSION_PLATFORM,
@@ -137,6 +142,7 @@ _VAR_MAP = {
     "HERMES_CRON_AUTO_DELIVER_PLATFORM": _CRON_AUTO_DELIVER_PLATFORM,
     "HERMES_CRON_AUTO_DELIVER_CHAT_ID": _CRON_AUTO_DELIVER_CHAT_ID,
     "HERMES_CRON_AUTO_DELIVER_THREAD_ID": _CRON_AUTO_DELIVER_THREAD_ID,
+    "HERMES_CRON_SESSION": _CRON_SESSION,
 }
 
 
@@ -349,6 +355,22 @@ def get_session_env(name: str, default: str = "") -> str:
             return value
     # Fall back to os.environ for CLI, cron, and test compatibility
     return os.getenv(name, default)
+
+
+def set_cron_session(active: bool = True):
+    """Bind cron classification for this task/thread and return its token."""
+    return _CRON_SESSION.set("1" if active else "")
+
+
+def reset_cron_session(token) -> None:
+    """Restore the cron classification that preceded ``set_cron_session``."""
+    _CRON_SESSION.reset(token)
+
+
+def is_cron_session() -> bool:
+    """Return whether the current execution context is a scheduled job."""
+    value = str(get_session_env("HERMES_CRON_SESSION", "") or "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
 
 
 def declare_stateless_channel() -> None:

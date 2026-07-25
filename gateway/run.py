@@ -18746,6 +18746,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return  # already enriched
         parsed = _parse_session_key(evt.get("session_key", "") or "")
         if not parsed:
+            # API-server conversations use an opaque X-Hermes-Session-Id
+            # rather than an ``agent:main:...`` key. Async delegation persists
+            # that raw return address separately so enrich it as an API source
+            # up front. This avoids an expected-but-noisy "unresolvable"
+            # warning before _inject_watch_notification takes the self-post
+            # delivery path.
+            raw_session_id = str(evt.get("origin_session_id") or "").strip()
+            if raw_session_id:
+                evt["platform"] = Platform.API_SERVER.value
+                evt["chat_type"] = "dm"
+                evt["chat_id"] = raw_session_id
             return
         evt["platform"] = parsed.get("platform", "")
         evt["chat_type"] = parsed.get("chat_type", "")

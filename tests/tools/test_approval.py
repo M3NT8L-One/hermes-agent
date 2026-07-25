@@ -351,6 +351,25 @@ class TestDelegatedCapabilityGuardIntegration:
         assert not approval_module._pending
 
 
+def test_context_local_cron_marker_does_not_leak_into_gateway_approvals(monkeypatch):
+    """A completed cron job must not reclassify later gateway turns as cron."""
+    from gateway.session_context import reset_cron_session, set_cron_session
+
+    monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
+    monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
+
+    token = set_cron_session()
+    try:
+        assert approval_module._is_cron_approval_context() is True
+        assert approval_module._is_gateway_approval_context() is False
+        assert "HERMES_CRON_SESSION" not in os.environ
+    finally:
+        reset_cron_session(token)
+
+    assert approval_module._is_cron_approval_context() is False
+    assert approval_module._is_gateway_approval_context() is True
+
+
 class TestSmartApproval:
     def test_smart_is_the_default_approval_mode(self):
         from hermes_cli.config import DEFAULT_CONFIG

@@ -29,7 +29,12 @@ import pytest
 
 import gateway.session_context as sc
 from gateway.session_context import _VAR_MAP, clear_session_vars, set_session_vars
-from tools.environments.local import _make_run_env, _sanitize_subprocess_env, hermes_subprocess_env
+from tools.environments.local import (
+    LocalEnvironment,
+    _make_run_env,
+    _sanitize_subprocess_env,
+    hermes_subprocess_env,
+)
 
 # The full set of session vars the bridge owns.
 SESSION_VARS = list(_VAR_MAP.keys())
@@ -302,3 +307,79 @@ def test_hermes_subprocess_env_unengaged_preserves_fallback(monkeypatch):
     # not engaged (autouse fixture leaves _session_context_engaged False)
     env = hermes_subprocess_env()
     assert env.get("HERMES_SESSION_KEY") == "cli-fallback-key"
+
+
+def test_persistent_snapshot_does_not_leak_child_or_prior_session_metadata(
+    monkeypatch,
+    tmp_path,
+):
+    """A shared terminal keeps user state, never request/worker identity.
+
+    Parent sessions and ``delegate_task`` children deliberately share one
+    ``LocalEnvironment``. Each command is a fresh bash process whose exported
+    state is restored from the previous command's snapshot. Request-scoped
+    Hermes metadata must therefore be supplied by the current process env on
+    every call rather than persisted in that shared shell snapshot.
+    """
+    from agent.delegation_context import delegated_child_context
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "parent-task")
+    env = LocalEnvironment(cwd=str(tmp_path), timeout=15)
+    command = (
+        "printf '%s|%s|%s\\n' "
+        "\"${HERMES_SESSION_ID-unset}\" "
+        "\"${HERMES_DELEGATED_CHILD_CONTEXT-unset}\" "
+        "\"${HERMES_KANBAN_TASK-unset}\""
+    )
+
+    try:
+        parent_a_tokens = set_session_vars(
+            platform="api_server",
+            chat_id="parent-a",
+            session_key="run-parent-a",
+            session_id="parent-a",
+        )
+        try:
+            parent_a = env.execute(command, timeout=15)["output"].strip()
+            with delegated_child_context():
+                child_a = env.execute(command, timeout=15)["output"].strip()
+        finally:
+            clear_session_vars(parent_a_tokens)
+
+        parent_b_tokens = set_session_vars(
+            platform="api_server",
+            chat_id="parent-b",
+            session_key="run-parent-b",
+            session_id="parent-b",
+        )
+        try:
+            parent_b = env.execute(command, timeout=15)["output"].strip()
+        finally:
+            clear_session_vars(parent_b_tokens)
+    finally:
+        env.cleanup()
+
+    assert parent_a == "parent-a|unset|parent-task"
+    assert child_a == "parent-a|1|unset"
+    assert parent_b == "parent-b|unset|parent-task"
+
+
+def test_cron_classification_is_context_local_and_reaches_subprocess(monkeypatch):
+    """Cron approval state reaches its tools without becoming process-global."""
+    from gateway.session_context import (
+        is_cron_session,
+        reset_cron_session,
+        set_cron_session,
+    )
+
+    monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
+    token = set_cron_session()
+    try:
+        assert is_cron_session() is True
+        assert _make_run_env({})["HERMES_CRON_SESSION"] == "1"
+        assert "HERMES_CRON_SESSION" not in os.environ
+    finally:
+        reset_cron_session(token)
+
+    assert is_cron_session() is False
+    assert "HERMES_CRON_SESSION" not in _make_run_env({})

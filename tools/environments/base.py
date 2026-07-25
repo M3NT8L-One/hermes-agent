@@ -51,6 +51,58 @@ _activity_callback_local = threading.local()
 _UNBOUNDED_CAPTURE_CHARS = 2**63 - 1
 
 
+_TRANSIENT_SNAPSHOT_ENV_VARS = (
+    "HERMES_SESSION_PLATFORM",
+    "HERMES_SESSION_SOURCE",
+    "HERMES_SESSION_CHAT_ID",
+    "HERMES_SESSION_CHAT_NAME",
+    "HERMES_SESSION_THREAD_ID",
+    "HERMES_SESSION_USER_ID",
+    "HERMES_SESSION_USER_NAME",
+    "HERMES_SESSION_KEY",
+    "HERMES_SESSION_ID",
+    "HERMES_UI_SESSION_ID",
+    "HERMES_SESSION_MESSAGE_ID",
+    "HERMES_SESSION_PROFILE",
+    "HERMES_CRON_AUTO_DELIVER_PLATFORM",
+    "HERMES_CRON_AUTO_DELIVER_CHAT_ID",
+    "HERMES_CRON_AUTO_DELIVER_THREAD_ID",
+    "HERMES_CRON_SESSION",
+    "HERMES_DELEGATED_CHILD_CONTEXT",
+    # These are the dispatcher-owned variables scrubbed from delegate_task
+    # children by agent.delegation_context.scrub_kanban_env().
+    "HERMES_KANBAN_TASK",
+    "HERMES_KANBAN_RUN_ID",
+    "HERMES_KANBAN_WORKSPACE",
+    "HERMES_KANBAN_WORKSPACES_ROOT",
+    "HERMES_KANBAN_CLAIM_LOCK",
+    "HERMES_KANBAN_BOARD",
+    "HERMES_KANBAN_DB",
+)
+
+
+def _snapshot_env_export(target: str) -> str:
+    """Export persistent shell state without request-scoped Hermes metadata.
+
+    Parent sessions and ``delegate_task`` children intentionally share one
+    long-lived environment snapshot. Their routing, approval, cron, and Kanban
+    identity does *not* belong to that shell state: each process spawn injects
+    the current execution context afresh. Persisting those variables lets one
+    child or conversation impersonate the next when the snapshot is sourced.
+
+    Run the unsets in a subshell so the active command keeps its metadata while
+    only the serialized snapshot is scrubbed. The list is exact rather than
+    prefix-based because user-owned variables such as
+    ``HERMES_SESSION_ENV_PROBE`` are ordinary persistent shell state.
+    """
+    transient_vars = " ".join(_TRANSIENT_SNAPSHOT_ENV_VARS)
+    return (
+        "( "
+        f"unset {transient_vars}; "
+        f"export -p > {target} )"
+    )
+
+
 class _BoundedOutputCollector:
     """Retain a bounded 40/60 head-tail window of streamed text."""
     def __init__(self, max_chars: int):
@@ -550,9 +602,8 @@ class BaseEnvironment(ABC):
         # Route through the backend hook so native and mixed Windows paths are
         # converted to Git-Bash form before quoting.
         _snap_tmp_template = self._quote_shell_path(self._snapshot_path + ".tmp.XXXXXX")
-        # Precompute outside f-string expressions: Python <3.12 rejects
-        # backslashes inside f-string ``{...}`` parts.
-        _snapshot_export = _export_dump_excluding_session_vars('"$__hermes_snap_tmp"')
+        # Scrub request-scoped Hermes identity from the durable snapshot.
+        _snapshot_export = _snapshot_env_export('"$__hermes_snap_tmp"')
         bootstrap = (
             f"umask 077\n"
             f"__hermes_snap_tmp=$(mktemp {_snap_tmp_template}) || exit 1\n"
@@ -671,7 +722,7 @@ class BaseEnvironment(ABC):
         # to share the same ``.tmp.`` path. Route the template through the
         # backend hook so Windows/Git-Bash paths and spaces remain safe.
         _snap_tmp_template = self._quote_shell_path(self._snapshot_path + ".tmp.XXXXXX")
-        _snapshot_export = _export_dump_excluding_session_vars('"$__hermes_snap_tmp"')
+        _snapshot_export = _snapshot_env_export('"$__hermes_snap_tmp"')
 
         parts = []
 
