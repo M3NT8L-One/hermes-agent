@@ -257,13 +257,13 @@ def test_pinned_specs_strips_env_markers_and_matches_extras(tmp_path):
     root = _project(tmp_path)
     (root / "pyproject.toml").write_text(
         '[project]\nname = "x"\ndependencies = [\n'
-        '  "cryptography==46.0.7; python_version >= \'3.11\'",\n'
+        '  "cryptography==48.0.1; python_version >= \'3.11\'",\n'
         '  "PyJWT[crypto]==2.13.0",\n'
         "]\n",
         encoding="utf-8",
     )
     assert er._pinned_specs(["cryptography", "PyJWT"], root) == [
-        "cryptography==46.0.7",
+        "cryptography==48.0.1",
         "PyJWT[crypto]==2.13.0",
     ]
 

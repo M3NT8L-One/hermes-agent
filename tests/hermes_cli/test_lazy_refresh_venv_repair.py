@@ -323,7 +323,7 @@ def test_lazy_refresh_repair_specs_resolves_extras(tmp_path, monkeypatch):
             version = "0.0.0"
             dependencies = [
               "PyJWT[crypto]==2.13.0",
-              "cryptography==46.0.7",
+              "cryptography==48.0.1",
             ]
         """
         )
@@ -331,4 +331,4 @@ def test_lazy_refresh_repair_specs_resolves_extras(tmp_path, monkeypatch):
     monkeypatch.setattr(m, "PROJECT_ROOT", tmp_path)
 
     specs = m._lazy_refresh_repair_specs(["PyJWT", "cryptography"])
-    assert specs == ["PyJWT[crypto]==2.13.0", "cryptography==46.0.7"]
+    assert specs == ["PyJWT[crypto]==2.13.0", "cryptography==48.0.1"]
