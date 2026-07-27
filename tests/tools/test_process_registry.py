@@ -7,6 +7,8 @@ import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
+
 import pytest
 from unittest.mock import MagicMock, patch
 
@@ -18,6 +20,39 @@ from tools.process_registry import (
     MAX_PROCESSES,
     MAX_ACTIVE_PROCESS_AGE,
 )
+
+
+def test_plain_module_import_does_not_open_state_db(tmp_path):
+    """Candidate import validation must not join the live SQLite generation."""
+    repo = Path(__file__).resolve().parents[2]
+    hermes_home = tmp_path / "would-be-live-home"
+    hermes_home.mkdir()
+    env = {
+        **os.environ,
+        "HERMES_HOME": str(hermes_home),
+        "PYTHONPATH": str(repo),
+    }
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from pathlib import Path\n"
+                "import os\n"
+                "import tools.process_registry\n"
+                "print((Path(os.environ['HERMES_HOME']) / 'state.db').exists())\n"
+            ),
+        ],
+        cwd=repo,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=20,
+        check=True,
+    )
+
+    assert result.stdout.strip().splitlines()[-1] == "False"
+    assert not (hermes_home / "state.db").exists()
 
 
 @pytest.fixture()

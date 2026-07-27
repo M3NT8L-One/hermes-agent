@@ -170,14 +170,19 @@ class ProcessRegistry:
         # both land here, distinguished by "type" field.  CLI process_loop and
         # gateway drain this after each agent turn to auto-trigger new turns.
         import queue as _queue_mod
-        self.completion_queue: _queue_mod.Queue = _queue_mod.Queue()
-        # Rehydrate durable delegation completions only at registry startup.
-        # Consumers still inject them as fresh turns through this existing rail.
-        try:
-            from tools.async_delegation import restore_undelivered_completions
-            restore_undelivered_completions(self.completion_queue)
-        except Exception as exc:
-            logger.warning("Could not restore async delegation completions: %s", exc)
+        self._completion_queue: _queue_mod.Queue = _queue_mod.Queue()
+        # Durable completions are restored on first queue use, not while this
+        # module's singleton is being imported.  Import validation routinely
+        # loads tool modules from candidate interpreters; opening state.db as a
+        # side effect of that validation can join the live WAL generation and
+        # is especially dangerous when the candidate links a vulnerable SQLite.
+        #
+        # RLock permits defensive same-thread re-entry while
+        # restore_undelivered_completions imports its dependencies.  The
+        # attempted flag is set before restoration so any such re-entry sees
+        # the already-created in-memory queue without recursing.
+        self._durable_restore_lock = threading.RLock()
+        self._durable_restore_attempted = False
 
         # Track sessions whose completion was already consumed by the agent
         # via wait/log.  Drain loops AND gateway/tui watchers skip notifications
@@ -212,6 +217,46 @@ class ProcessRegistry:
         # terminal tab. Distinct from kill — the process keeps running; only the
         # UI view is dropped (the user can reopen it from the status stack).
         self.on_close = None
+
+    @property
+    def completion_queue(self):
+        """Return the shared completion queue, restoring durable events once.
+
+        Constructing or importing a registry remains state.db-free.  Actual
+        queue consumers retain the historical startup behavior: their first
+        access rehydrates undelivered async-delegation completions before the
+        queue is returned.
+        """
+        with self._durable_restore_lock:
+            if not self._durable_restore_attempted:
+                self._durable_restore_attempted = True
+                try:
+                    from tools.async_delegation import (
+                        restore_undelivered_completions,
+                    )
+
+                    restore_undelivered_completions(self._completion_queue)
+                except Exception as exc:
+                    logger.warning(
+                        "Could not restore async delegation completions: %s",
+                        exc,
+                    )
+        return self._completion_queue
+
+    @completion_queue.setter
+    def completion_queue(self, value) -> None:
+        """Replace the queue without triggering a durable restore.
+
+        ``completion_queue`` was historically a public attribute, so retain
+        assignment compatibility for isolated consumers and tests.
+        """
+        if not hasattr(self, "_durable_restore_lock"):
+            # Some narrow embedders construct a query-only registry via
+            # ``__new__`` and seed its public fields directly.
+            self._durable_restore_lock = threading.RLock()
+        with self._durable_restore_lock:
+            self._completion_queue = value
+            self._durable_restore_attempted = True
 
     @staticmethod
     def _clean_shell_noise(text: str) -> str:

@@ -523,16 +523,17 @@ class TestRuntimeCutover:
         candidate = tmp_path / "venv"
         candidate.mkdir()
         fixed = _runtime_info(candidate / "bin" / "python", (3, 53, 1))
-        failed = MagicMock(returncode=1, stdout=" \n", stderr="\n")
         with patch(
-            "hermes_cli.managed_uv.probe_sqlite_runtime",
-            return_value=fixed,
-        ), patch("hermes_cli.managed_uv.subprocess.run", return_value=failed):
+            "hermes_cli.managed_uv.run_isolated_import_smoke",
+            return_value=(False, "core import smoke failed", fixed),
+        ) as smoke:
             healthy, detail, info = _smoke_candidate_venv(candidate)
 
         assert healthy is False
         assert detail == "core import smoke failed"
         assert info == fixed
+        modules = smoke.call_args.args[1]
+        assert "tools.process_registry" in modules
 
     def test_successfully_renames_candidate_into_live_path(self, tmp_path):
         from hermes_cli.managed_uv import _cut_over_candidate

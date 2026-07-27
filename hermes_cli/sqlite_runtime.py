@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -74,6 +75,39 @@ print(json.dumps({
 }))
 """
 
+_IMPORT_SMOKE_SCRIPT = """
+import importlib
+import sys
+
+for module_name in sys.argv[1:]:
+    try:
+        importlib.import_module(module_name)
+    except Exception as exc:
+        print(
+            f"{module_name}: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+"""
+
+_PYTHON_ENV_OVERRIDES = (
+    "CONDA_DEFAULT_ENV",
+    "CONDA_PREFIX",
+    "PYTHONHOME",
+    "PYTHONPATH",
+    "UV_PROJECT_ENVIRONMENT",
+    "UV_PYTHON",
+    "VIRTUAL_ENV",
+)
+
+
+def _sanitized_python_env() -> dict[str, str]:
+    """Return an environment free of interpreter-selection overrides."""
+    env = dict(os.environ)
+    for key in _PYTHON_ENV_OVERRIDES:
+        env.pop(key, None)
+    return env
+
 
 def probe_sqlite_runtime(
     python: str | Path,
@@ -86,17 +120,7 @@ def probe_sqlite_runtime(
     data.  The child runs isolated from inherited Python path overrides.
     """
     executable = Path(python)
-    env = dict(os.environ)
-    for key in (
-        "CONDA_DEFAULT_ENV",
-        "CONDA_PREFIX",
-        "PYTHONHOME",
-        "PYTHONPATH",
-        "UV_PROJECT_ENVIRONMENT",
-        "UV_PYTHON",
-        "VIRTUAL_ENV",
-    ):
-        env.pop(key, None)
+    env = _sanitized_python_env()
     try:
         result = subprocess.run(
             [str(executable), "-I", "-c", _PROBE_SCRIPT],
@@ -122,3 +146,80 @@ def probe_sqlite_runtime(
         )
     except (KeyError, TypeError, ValueError, json.JSONDecodeError):
         return None
+
+
+def run_isolated_import_smoke(
+    python: str | Path,
+    modules: Iterable[str],
+    *,
+    cwd: str | Path | None = None,
+    timeout: float = 90.0,
+) -> tuple[bool, str, SQLiteRuntimeInfo | None]:
+    """Import *modules* without exposing live Hermes state to the child.
+
+    The exact target interpreter is probed first and rejected when its linked
+    SQLite contains the WAL-reset corruption bug.  A passing interpreter then
+    runs with ``HERMES_HOME``, ``HOME``, and ``USERPROFILE`` redirected into
+    one temporary directory, so both profile-aware and legacy home-relative
+    imports are unable to open the operator's live ``state.db``.
+
+    Returns ``(healthy, detail, runtime_info)`` and never raises for ordinary
+    execution or import failures.
+    """
+    # Absolutize once before either child runs, but deliberately do not resolve
+    # symlinks: venv/bin/python commonly points at a base interpreter, and
+    # executing the resolved target would lose the venv's site-packages.
+    executable = Path(os.path.abspath(os.path.expanduser(os.fspath(python))))
+    requested = tuple(str(module).strip() for module in modules if str(module).strip())
+    if not requested:
+        return False, "no import modules requested", None
+
+    info = probe_sqlite_runtime(executable, timeout=min(timeout, 30.0))
+    if info is None:
+        return False, f"could not execute {executable}", None
+    if info.wal_reset_vulnerable:
+        return (
+            False,
+            f"interpreter links vulnerable SQLite {info.sqlite_version_string}",
+            info,
+        )
+
+    env = _sanitized_python_env()
+    try:
+        with tempfile.TemporaryDirectory(prefix="hermes-import-smoke-") as root:
+            isolated_home = Path(root) / "home"
+            isolated_hermes = isolated_home / ".hermes"
+            isolated_hermes.mkdir(parents=True)
+            env.update(
+                {
+                    "HOME": str(isolated_home),
+                    "USERPROFILE": str(isolated_home),
+                    "HERMES_HOME": str(isolated_hermes),
+                    "HERMES_IMPORT_SMOKE": "1",
+                }
+            )
+            result = subprocess.run(
+                [
+                    str(executable),
+                    "-I",
+                    "-c",
+                    _IMPORT_SMOKE_SCRIPT,
+                    *requested,
+                ],
+                cwd=str(cwd) if cwd is not None else None,
+                env=env,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout,
+                check=False,
+            )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, str(exc), info
+
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "import smoke failed").strip()
+        last_line = detail.splitlines()[-1] if detail else "import smoke failed"
+        return False, last_line, info
+    return True, "", info

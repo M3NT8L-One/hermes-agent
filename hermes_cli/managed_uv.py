@@ -34,7 +34,11 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from hermes_constants import get_hermes_home
-from hermes_cli.sqlite_runtime import SQLiteRuntimeInfo, probe_sqlite_runtime
+from hermes_cli.sqlite_runtime import (
+    SQLiteRuntimeInfo,
+    probe_sqlite_runtime,
+    run_isolated_import_smoke,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -601,50 +605,27 @@ def _install_safe_python_generation(
 
 
 def _smoke_candidate_venv(venv_dir: Path) -> tuple[bool, str, SQLiteRuntimeInfo | None]:
-    """Exercise the candidate interpreter and imports through its real path."""
+    """Exercise candidate imports without exposing the live Hermes home."""
     python = _venv_python(venv_dir)
-    info = probe_sqlite_runtime(python)
-    if info is None:
-        return False, f"could not execute {python}", None
-    if info.wal_reset_vulnerable:
-        return (
-            False,
-            f"candidate still links vulnerable SQLite {info.sqlite_version_string}",
-            info,
-        )
-
-    check = (
-        "import dotenv, fastapi, openai, prompt_toolkit, pydantic, rich, uvicorn, yaml\n"
-        "import hermes_state\n"
+    return run_isolated_import_smoke(
+        python,
+        (
+            "dotenv",
+            "fastapi",
+            "openai",
+            "prompt_toolkit",
+            "pydantic",
+            "rich",
+            "uvicorn",
+            "yaml",
+            "hermes_state",
+            # Regression target: importing this module used to open state.db
+            # immediately through durable-delegation restoration.
+            "tools.process_registry",
+        ),
+        cwd=venv_dir.parent,
+        timeout=90,
     )
-    env = dict(os.environ)
-    for key in (
-        "CONDA_DEFAULT_ENV",
-        "CONDA_PREFIX",
-        "PYTHONHOME",
-        "PYTHONPATH",
-        "UV_PROJECT_ENVIRONMENT",
-        "UV_PYTHON",
-        "VIRTUAL_ENV",
-    ):
-        env.pop(key, None)
-    try:
-        result = subprocess.run(
-            [str(python), "-I", "-c", check],
-            cwd=venv_dir.parent,
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=90,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        return False, str(exc), info
-    if result.returncode != 0:
-        detail = (result.stderr or result.stdout or "core import smoke failed").strip()
-        last_line = detail.splitlines()[-1] if detail else "core import smoke failed"
-        return False, last_line, info
-    return True, "", info
 
 
 def _stage_candidate_venv(
