@@ -11,17 +11,20 @@ HERMES_HOME root.
 import json
 import logging
 import os
+import re
 import shutil
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import time
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from hermes_constants import get_default_hermes_root, get_hermes_home, display_hermes_home
+from utils import atomic_json_write
 
 logger = logging.getLogger(__name__)
 
@@ -260,12 +263,31 @@ def _safe_copy_db(src: Path, dst: Path) -> bool:
     the DB is being written to. Fail closed if a consistent snapshot cannot
     be created: copying only the live main file can omit committed WAL data.
     """
-    conn = None
-    backup_conn = None
     try:
-        conn = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
-        backup_conn = sqlite3.connect(str(dst))
-        conn.backup(backup_conn)
+        # POSIX close() releases *this process's* locks for the inode, even
+        # when a different connection acquired them. Snapshot creation can run
+        # inside a gateway that already owns SessionDB, so every backup runs in
+        # a fresh spawned interpreter (never forked). Its close cannot cancel
+        # the parent process's long-lived SQLite locks.
+        script = (
+            "import sqlite3,sys;"
+            "src=sqlite3.connect('file:'+sys.argv[1]+'?mode=ro',uri=True);"
+            "dst=sqlite3.connect(sys.argv[2]);"
+            "src.backup(dst);dst.close();src.close()"
+        )
+        completed = subprocess.run(
+            [sys.executable, "-c", script, str(src), str(dst)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=300,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError(
+                completed.stderr.strip()
+                or f"backup subprocess exited {completed.returncode}"
+            )
         return True
     except Exception as exc:
         logger.warning("SQLite safe copy failed for %s: %s", src, exc)
@@ -274,13 +296,6 @@ def _safe_copy_db(src: Path, dst: Path) -> bool:
         except OSError:
             pass
         return False
-    finally:
-        for connection in (backup_conn, conn):
-            if connection is not None:
-                try:
-                    connection.close()
-                except Exception:
-                    pass
 
 
 def is_zeroed_sqlite_file(
@@ -488,6 +503,870 @@ def copy_db_and_verify(src: Path, dst: Path) -> bool:
     return True
 
 
+_SQLITE_COHORT_SUFFIXES = ("", "-wal", "-shm", "-journal")
+
+
+def _sqlite_cohort_fingerprint(path: Path) -> dict[str, tuple[int, int, int] | None]:
+    """Return inode/size/mtime fingerprints for a SQLite file cohort."""
+
+    result: dict[str, tuple[int, int, int] | None] = {}
+    for suffix in _SQLITE_COHORT_SUFFIXES:
+        member = Path(f"{path}{suffix}")
+        try:
+            stat = member.stat()
+            result[suffix or "main"] = (
+                int(stat.st_ino),
+                int(stat.st_size),
+                int(stat.st_mtime_ns),
+            )
+        except FileNotFoundError:
+            result[suffix or "main"] = None
+    return result
+
+
+def _fsync_file(path: Path) -> None:
+    with path.open("rb") as handle:
+        os.fsync(handle.fileno())
+
+
+def _fsync_directory(path: Path) -> None:
+    """Best-effort durability barrier for rename-heavy recovery operations."""
+
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def _operation_slug(value: str) -> str:
+    slug = re.sub(r"[^a-zA-Z0-9._-]+", "-", value.strip()).strip("-")
+    return slug[:60] or "sqlite-restore"
+
+
+def _replacement_integrity_check(
+    path: Path,
+    target: Path,
+    *,
+    verify_fn: Callable[[Path], dict] | None,
+) -> dict:
+    """Run full structural and state-specific semantic integrity checks."""
+
+    if verify_fn is not None:
+        return verify_fn(path)
+    result = verify_sqlite_integrity(path, max_bytes=0)
+    result["verification_level"] = "full-integrity-check"
+    if not result.get("valid") or target.name != "state.db":
+        return result
+    try:
+        from hermes_state import _db_opens_cleanly
+
+        semantic_error = _db_opens_cleanly(path)
+    except Exception as exc:
+        semantic_error = f"state semantic verification failed: {exc}"
+    if semantic_error is not None:
+        return {
+            "valid": False,
+            "message": semantic_error,
+            "size": result.get("size"),
+            "verification_level": "full-integrity-plus-state-semantic",
+        }
+    result["verification_level"] = "full-integrity-plus-state-semantic"
+    result["message"] = (
+        f"{result.get('message', 'integrity check passed')}; "
+        "state schema, FTS read, and rolled-back write probes passed"
+    )
+    return result
+
+
+def _source_candidate_integrity_check(
+    path: Path,
+    *,
+    verify_fn: Callable[[Path], dict] | None,
+) -> dict:
+    """Non-mutating source preflight; semantic writes run only on staging."""
+
+    if verify_fn is not None:
+        return verify_fn(path)
+    result = verify_sqlite_integrity(path, max_bytes=0)
+    result["verification_level"] = "full-integrity-source-preflight"
+    return result
+
+
+def _discard_disposable_sqlite_sidecars(path: Path) -> None:
+    """Remove sidecars created only by rolled-back probes on a staged clone."""
+
+    for suffix in ("-wal", "-shm", "-journal"):
+        Path(f"{path}{suffix}").unlink(missing_ok=True)
+    _fsync_file(path)
+    _fsync_directory(path.parent)
+
+
+def _copy_sqlite_bundle_raw(source: Path, destination: Path) -> None:
+    """Copy an offline SQLite main/sidecar bundle without opening the source."""
+
+    copied_main = False
+    for suffix in _SQLITE_COHORT_SUFFIXES:
+        source_member = Path(f"{source}{suffix}")
+        if not source_member.exists():
+            continue
+        destination_member = Path(f"{destination}{suffix}")
+        shutil.copy2(source_member, destination_member)
+        _fsync_file(destination_member)
+        if not suffix:
+            copied_main = True
+    if not copied_main:
+        raise FileNotFoundError(source)
+    _fsync_directory(destination.parent)
+
+
+def replace_sqlite_db_offline(
+    candidate: Path,
+    target: Path,
+    *,
+    reason: str,
+    evidence_root: Path | None = None,
+    verify_fn: Callable[[Path], dict] | None = None,
+    quiescence_fn: Callable[[Path], Any] | None = None,
+) -> dict[str, Any]:
+    """Atomically install a validated SQLite DB while its cohort is offline.
+
+    The candidate is copied to same-directory staging, validated, and fsynced.
+    Ownership is proven twice and the target fingerprint must remain unchanged.
+    The existing main/WAL/SHM/journal cohort is moved into a unique rollback
+    directory before ``os.replace`` installs the staged main file. Both
+    success and failure preserve a receipt and all displaced evidence.
+    """
+
+    from hermes_cli.runtime_ownership import prove_state_db_quiescent
+
+    candidate = Path(candidate).expanduser().resolve(strict=False)
+    target = Path(target).expanduser().resolve(strict=False)
+    prove = quiescence_fn or prove_state_db_quiescent
+    result: dict[str, Any] = {
+        "applied": False,
+        "deferred": False,
+        "rollback_performed": False,
+        "reason": "",
+        "evidence_dir": None,
+        "receipt_path": None,
+    }
+
+    def _proof() -> tuple[bool, str]:
+        try:
+            proof = prove(target)
+        except Exception as exc:
+            return False, f"ownership probe failed: {exc}"
+        return bool(getattr(proof, "quiescent", False)), str(
+            getattr(proof, "reason", "ownership was not proven")
+        )
+
+    initial_ok, initial_reason = _proof()
+    if not initial_ok:
+        result.update(
+            deferred=True,
+            reason=(
+                f"refusing {reason}: SQLite cohort is not proven offline "
+                f"({initial_reason})"
+            ),
+        )
+        return result
+
+    candidate_proof = prove(candidate)
+    if not bool(getattr(candidate_proof, "quiescent", False)):
+        result["reason"] = (
+            "candidate SQLite cohort is not proven offline: "
+            + str(getattr(candidate_proof, "reason", "unknown ownership"))
+        )
+        return result
+    candidate_fingerprint = _sqlite_cohort_fingerprint(candidate)
+    candidate_check: dict[str, Any] = {
+        "valid": False,
+        "message": "pending raw-clone verification",
+        "verification_level": "pending",
+    }
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    operation_id = f"{stamp}-{os.getpid()}-{_operation_slug(reason)}"
+    evidence_base = evidence_root or (
+        target.parent / "backups" / "sqlite-cohort-operations"
+    )
+    evidence_dir = evidence_base / operation_id
+    evidence_dir.mkdir(parents=True, exist_ok=False)
+    receipt_path = evidence_dir / "receipt.json"
+    result["evidence_dir"] = str(evidence_dir)
+    result["receipt_path"] = str(receipt_path)
+
+    stage = target.parent / f".{target.name}.{operation_id}.staged"
+    candidate_clone = evidence_dir / f"source-{candidate.name}"
+    receipt: dict[str, Any] = {
+        "operation_id": operation_id,
+        "reason": reason,
+        "candidate": str(candidate),
+        "target": str(target),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "status": "preparing",
+        "candidate_integrity": candidate_check,
+        "verification_level": candidate_check.get("verification_level"),
+        "original_fingerprint": _sqlite_cohort_fingerprint(target),
+        "moved_originals": {},
+        "preserved_failed_install": {},
+    }
+    atomic_json_write(receipt_path, receipt, indent=2)
+
+    def _write_receipt(status: str, **updates: Any) -> None:
+        receipt["status"] = status
+        receipt.update(updates)
+        atomic_json_write(receipt_path, receipt, indent=2)
+        _fsync_directory(evidence_dir)
+
+    moved: dict[str, Path] = {}
+    stage_installed = False
+
+    def _preserve_stage(label: str) -> None:
+        if not stage.exists():
+            return
+        destination = evidence_dir / label
+        os.replace(stage, destination)
+        receipt["preserved_stage"] = str(destination)
+
+    def _rollback_originals() -> list[str]:
+        errors: list[str] = []
+        rollback_ok, rollback_reason = _proof()
+        if not rollback_ok:
+            return [
+                "manual recovery required; rollback refused because target "
+                f"became live or unverified: {rollback_reason}"
+            ]
+        for suffix in _SQLITE_COHORT_SUFFIXES:
+            key = suffix or "main"
+            member = Path(f"{target}{suffix}")
+            originally_absent = receipt["original_fingerprint"].get(key) is None
+            if member.exists() and (key in moved or (stage_installed and originally_absent)):
+                failed = evidence_dir / (
+                    f"failed-installed-{target.name}{suffix or ''}"
+                )
+                try:
+                    os.replace(member, failed)
+                    receipt["preserved_failed_install"][suffix or "main"] = str(
+                        failed
+                    )
+                except OSError as exc:
+                    errors.append(f"preserve failed install {member}: {exc}")
+        for suffix in _SQLITE_COHORT_SUFFIXES:
+            key = suffix or "main"
+            original = moved.get(key)
+            if original is None:
+                continue
+            try:
+                os.replace(original, Path(f"{target}{suffix}"))
+            except OSError as exc:
+                errors.append(f"restore original {key}: {exc}")
+        _fsync_directory(target.parent)
+        return errors
+
+    try:
+        _copy_sqlite_bundle_raw(candidate, candidate_clone)
+        candidate_recheck = prove(candidate)
+        if (
+            not bool(getattr(candidate_recheck, "quiescent", False))
+            or _sqlite_cohort_fingerprint(candidate) != candidate_fingerprint
+        ):
+            result.update(
+                deferred=True,
+                reason=(
+                    "candidate SQLite cohort changed or became live while "
+                    "being copied to offline evidence"
+                ),
+            )
+            _write_receipt(
+                "deferred-unstable-candidate",
+                error=result["reason"],
+            )
+            return result
+        candidate_check = _source_candidate_integrity_check(
+            candidate_clone,
+            verify_fn=verify_fn,
+        )
+        receipt["candidate_integrity"] = candidate_check
+        receipt["verification_level"] = candidate_check.get(
+            "verification_level"
+        )
+        if not candidate_check.get("valid"):
+            result["reason"] = (
+                "candidate failed integrity verification: "
+                f"{candidate_check.get('message', 'unknown error')}"
+            )
+            _write_receipt(
+                "rejected-source-candidate",
+                error=result["reason"],
+            )
+            return result
+        if not _safe_copy_db(candidate_clone, stage):
+            raise RuntimeError("could not normalize candidate SQLite cohort")
+        os.chmod(stage, 0o600)
+        _fsync_file(stage)
+        staged_check = _replacement_integrity_check(
+            stage,
+            target,
+            verify_fn=verify_fn,
+        )
+        if staged_check.get("valid"):
+            _discard_disposable_sqlite_sidecars(stage)
+        receipt["staged_integrity"] = staged_check
+        if not staged_check.get("valid"):
+            _preserve_stage("invalid-staged-candidate.db")
+            result["reason"] = (
+                "staged candidate failed integrity verification: "
+                f"{staged_check.get('message', 'unknown error')}"
+            )
+            _write_receipt("rejected-staged-candidate", error=result["reason"])
+            return result
+
+        second_ok, second_reason = _proof()
+        current_fingerprint = _sqlite_cohort_fingerprint(target)
+        if not second_ok or current_fingerprint != receipt["original_fingerprint"]:
+            _preserve_stage("deferred-staged-candidate.db")
+            result.update(
+                deferred=True,
+                reason=(
+                    f"refusing {reason}: SQLite cohort changed or became live "
+                    f"before replacement ({second_reason})"
+                ),
+            )
+            _write_receipt(
+                "deferred-before-mutation",
+                error=result["reason"],
+                recheck_fingerprint=current_fingerprint,
+            )
+            return result
+
+        _write_receipt("mutation-started")
+        for suffix in _SQLITE_COHORT_SUFFIXES:
+            member = Path(f"{target}{suffix}")
+            if not member.exists():
+                continue
+            key = suffix or "main"
+            preserved = evidence_dir / f"original-{target.name}{suffix}"
+            os.replace(member, preserved)
+            moved[key] = preserved
+            receipt["moved_originals"][key] = str(preserved)
+        _fsync_directory(target.parent)
+        _write_receipt("original-cohort-preserved")
+
+        install_ok, install_reason = _proof()
+        if not install_ok:
+            rollback_errors = _rollback_originals()
+            result["rollback_performed"] = bool(moved) and not rollback_errors
+            result["reason"] = (
+                "SQLite cohort became live before staged install: "
+                + install_reason
+            )
+            status = (
+                "manual-recovery-required"
+                if rollback_errors
+                else "rolled-back"
+            )
+            _write_receipt(
+                status,
+                error=result["reason"],
+                rollback_errors=rollback_errors,
+            )
+            return result
+
+        os.replace(stage, target)
+        stage_installed = True
+        _fsync_directory(target.parent)
+        installed_check = _replacement_integrity_check(
+            target,
+            target,
+            verify_fn=verify_fn,
+        )
+        receipt["installed_integrity"] = installed_check
+        if not installed_check.get("valid"):
+            rollback_errors = _rollback_originals()
+            result["rollback_performed"] = (
+                bool(moved) or stage_installed
+            ) and not rollback_errors
+            result["reason"] = (
+                "installed database failed integrity verification: "
+                f"{installed_check.get('message', 'unknown error')}"
+            )
+            status = (
+                "manual-recovery-required"
+                if rollback_errors
+                else "rolled-back"
+            )
+            _write_receipt(
+                status,
+                error=result["reason"],
+                rollback_errors=rollback_errors,
+            )
+            return result
+
+        result.update(applied=True, reason="validated SQLite cohort installed")
+        _write_receipt("complete", completed_at=datetime.now(timezone.utc).isoformat())
+        return result
+    except Exception as exc:
+        rollback_errors: list[str] = []
+        if moved or stage_installed:
+            rollback_errors = _rollback_originals()
+            result["rollback_performed"] = (
+                bool(moved) or stage_installed
+            ) and not rollback_errors
+        try:
+            _preserve_stage("failed-staged-candidate.db")
+        except OSError as preserve_exc:
+            rollback_errors.append(f"preserve stage: {preserve_exc}")
+        result["reason"] = f"{reason} failed: {exc}"
+        try:
+            status = (
+                "manual-recovery-required"
+                if any("manual recovery required" in item for item in rollback_errors)
+                else (
+                    "rolled-back"
+                    if result["rollback_performed"]
+                    else "failed"
+                )
+            )
+            _write_receipt(
+                status,
+                error=result["reason"],
+                rollback_errors=rollback_errors,
+            )
+        except OSError:
+            pass
+        return result
+
+
+def replace_sqlite_db_cohort_offline(
+    replacements: list[tuple[Path, Path]],
+    *,
+    reason: str,
+    evidence_root: Path,
+    service_guard_paths: list[Path] | None = None,
+    verify_fn: Callable[[Path], dict] | None = None,
+    quiescence_fn: Callable[[Path], Any] | None = None,
+) -> dict[str, Any]:
+    """Apply multiple SQLite replacements as one rollback-backed cohort."""
+
+    from hermes_cli.runtime_ownership import prove_state_db_quiescent
+
+    prove = quiescence_fn or prove_state_db_quiescent
+    service_guards = tuple(
+        Path(path).expanduser().resolve(strict=False)
+        for path in (service_guard_paths or [])
+    )
+    pairs = [
+        (
+            Path(candidate).expanduser().resolve(strict=False),
+            Path(target).expanduser().resolve(strict=False),
+        )
+        for candidate, target in replacements
+    ]
+    targets = [target for _candidate, target in pairs]
+    if len(set(targets)) != len(targets):
+        return {
+            "applied": False,
+            "deferred": False,
+            "rollback_performed": False,
+            "reason": "duplicate SQLite target in restore cohort",
+        }
+    if not pairs:
+        return {
+            "applied": True,
+            "deferred": False,
+            "rollback_performed": False,
+            "reason": "no SQLite databases in restore cohort",
+        }
+
+    def _proof(target: Path) -> tuple[bool, str]:
+        try:
+            proof = prove(target)
+        except Exception as exc:
+            return False, f"ownership probe failed: {exc}"
+        return bool(getattr(proof, "quiescent", False)), str(
+            getattr(proof, "reason", "ownership was not proven")
+        )
+
+    def _service_proof() -> tuple[bool, str]:
+        if not service_guards:
+            return True, "no service guard requested"
+        for service_guard in service_guards:
+            ok, detail = _proof(service_guard)
+            if not ok:
+                return False, f"{service_guard}: {detail}"
+        return True, "all Hermes service cohorts are offline"
+
+    service_ok, service_detail = _service_proof()
+    if not service_ok:
+        return {
+            "applied": False,
+            "deferred": True,
+            "rollback_performed": False,
+            "reason": (
+                "refusing database cohort restore while the Hermes gateway/"
+                f"dashboard service cohort can reopen stores: {service_detail}"
+            ),
+        }
+
+    for candidate, target in pairs:
+        ok, detail = _proof(target)
+        if not ok:
+            return {
+                "applied": False,
+                "deferred": True,
+                "rollback_performed": False,
+                "reason": (
+                    f"refusing {reason}: {target} is not proven offline "
+                    f"({detail})"
+                ),
+            }
+        candidate_proof = prove(candidate)
+        if not bool(getattr(candidate_proof, "quiescent", False)):
+            return {
+                "applied": False,
+                "deferred": True,
+                "rollback_performed": False,
+                "reason": (
+                    f"candidate {candidate} is not proven offline: "
+                    f"{getattr(candidate_proof, 'reason', 'unknown ownership')}"
+                ),
+            }
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    operation_id = f"{stamp}-{os.getpid()}-{_operation_slug(reason)}"
+    evidence_dir = Path(evidence_root) / operation_id
+    evidence_dir.mkdir(parents=True, exist_ok=False)
+    receipt_path = evidence_dir / "receipt.json"
+    fingerprints = {
+        str(target): _sqlite_cohort_fingerprint(target) for target in targets
+    }
+    receipt: dict[str, Any] = {
+        "operation_id": operation_id,
+        "reason": reason,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "status": "preparing",
+        "targets": [str(target) for target in targets],
+        "verification_level": "full-integrity-plus-state-semantic-as-applicable",
+        "original_fingerprints": fingerprints,
+        "moved_originals": {},
+        "preserved_failed_install": {},
+    }
+    atomic_json_write(receipt_path, receipt, indent=2)
+
+    stages: dict[Path, Path] = {}
+    moved: dict[Path, dict[str, Path]] = {target: {} for target in targets}
+    installed: set[Path] = set()
+
+    def _write_receipt(status: str, **updates: Any) -> None:
+        receipt["status"] = status
+        receipt.update(updates)
+        atomic_json_write(receipt_path, receipt, indent=2)
+        _fsync_directory(evidence_dir)
+
+    def _label(index: int, target: Path, prefix: str, suffix: str = "") -> Path:
+        return evidence_dir / f"{prefix}-{index:03d}-{target.name}{suffix}"
+
+    def _preserve_stages(prefix: str) -> list[str]:
+        errors: list[str] = []
+        for index, (_candidate, target) in enumerate(pairs):
+            stage = stages.get(target)
+            if stage is None or not stage.exists():
+                continue
+            try:
+                os.replace(stage, _label(index, target, prefix))
+            except OSError as exc:
+                errors.append(f"preserve stage {stage}: {exc}")
+        return errors
+
+    def _rollback() -> list[str]:
+        errors: list[str] = []
+        service_ok, service_detail = _service_proof()
+        if not service_ok:
+            return [
+                "manual recovery required; cohort rollback refused because "
+                f"Hermes services became live or loaded: {service_detail}"
+            ]
+        for _candidate, target in pairs:
+            ok, detail = _proof(target)
+            if not ok:
+                return [
+                    "manual recovery required; cohort rollback refused because "
+                    f"{target} became live or unverified: {detail}"
+                ]
+        for index, (_candidate, target) in enumerate(pairs):
+            original_fingerprint = fingerprints[str(target)]
+            for suffix in _SQLITE_COHORT_SUFFIXES:
+                key = suffix or "main"
+                member = Path(f"{target}{suffix}")
+                originally_absent = original_fingerprint.get(key) is None
+                if not member.exists():
+                    continue
+                if key not in moved[target] and not (
+                    target in installed and originally_absent
+                ):
+                    continue
+                failed = _label(index, target, "failed-installed", suffix)
+                try:
+                    os.replace(member, failed)
+                    receipt["preserved_failed_install"][
+                        f"{target}:{key}"
+                    ] = str(failed)
+                except OSError as exc:
+                    errors.append(f"preserve failed install {member}: {exc}")
+        for _index, (_candidate, target) in enumerate(pairs):
+            for suffix in _SQLITE_COHORT_SUFFIXES:
+                key = suffix or "main"
+                original = moved[target].get(key)
+                if original is None:
+                    continue
+                try:
+                    os.replace(original, Path(f"{target}{suffix}"))
+                except OSError as exc:
+                    errors.append(f"restore {target} {key}: {exc}")
+            _fsync_directory(target.parent)
+        return errors
+
+    try:
+        for index, (candidate, target) in enumerate(pairs):
+            target.parent.mkdir(parents=True, exist_ok=True)
+            stage = target.parent / (
+                f".{target.name}.{operation_id}.{index:03d}.staged"
+            )
+            stages[target] = stage
+            candidate_fingerprint = _sqlite_cohort_fingerprint(candidate)
+            candidate_clone = _label(
+                index,
+                target,
+                "source-candidate",
+            )
+            _copy_sqlite_bundle_raw(candidate, candidate_clone)
+            candidate_recheck = prove(candidate)
+            if (
+                not bool(getattr(candidate_recheck, "quiescent", False))
+                or _sqlite_cohort_fingerprint(candidate)
+                != candidate_fingerprint
+            ):
+                raise RuntimeError(
+                    f"candidate {candidate} changed or became live during raw copy"
+                )
+            source_check = _source_candidate_integrity_check(
+                candidate_clone,
+                verify_fn=verify_fn,
+            )
+            if not source_check.get("valid"):
+                raise RuntimeError(
+                    f"candidate {candidate} failed integrity verification: "
+                    f"{source_check.get('message', 'unknown error')}"
+                )
+            if not _safe_copy_db(candidate_clone, stage):
+                raise RuntimeError(
+                    f"could not normalize candidate SQLite cohort {candidate}"
+                )
+            os.chmod(stage, 0o600)
+            _fsync_file(stage)
+            check = _replacement_integrity_check(
+                stage,
+                target,
+                verify_fn=verify_fn,
+            )
+            if check.get("valid"):
+                _discard_disposable_sqlite_sidecars(stage)
+            if not check.get("valid"):
+                errors = _preserve_stages("invalid-staged")
+                message = (
+                    f"staged candidate for {target} failed integrity: "
+                    f"{check.get('message', 'unknown error')}"
+                )
+                _write_receipt(
+                    "rejected-staged-candidate",
+                    error=message,
+                    preservation_errors=errors,
+                )
+                return {
+                    "applied": False,
+                    "deferred": False,
+                    "rollback_performed": False,
+                    "reason": message,
+                    "evidence_dir": str(evidence_dir),
+                    "receipt_path": str(receipt_path),
+                }
+
+        for _candidate, target in pairs:
+            ok, detail = _proof(target)
+            if not ok or _sqlite_cohort_fingerprint(target) != fingerprints[str(target)]:
+                errors = _preserve_stages("deferred-staged")
+                message = (
+                    f"refusing {reason}: {target} changed or became live "
+                    f"before replacement ({detail})"
+                )
+                _write_receipt(
+                    "deferred-before-mutation",
+                    error=message,
+                    preservation_errors=errors,
+                )
+                return {
+                    "applied": False,
+                    "deferred": True,
+                    "rollback_performed": False,
+                    "reason": message,
+                    "evidence_dir": str(evidence_dir),
+                    "receipt_path": str(receipt_path),
+                }
+
+        _write_receipt("mutation-started")
+        for index, (_candidate, target) in enumerate(pairs):
+            for suffix in _SQLITE_COHORT_SUFFIXES:
+                member = Path(f"{target}{suffix}")
+                if not member.exists():
+                    continue
+                key = suffix or "main"
+                preserved = _label(index, target, "original", suffix)
+                os.replace(member, preserved)
+                moved[target][key] = preserved
+                receipt["moved_originals"][f"{target}:{key}"] = str(preserved)
+            _fsync_directory(target.parent)
+        _write_receipt("original-cohort-preserved")
+
+        for _candidate, target in pairs:
+            service_ok, service_detail = _service_proof()
+            if not service_ok:
+                raise RuntimeError(
+                    "Hermes service cohort became live before staged install: "
+                    + service_detail
+                )
+            for _check_candidate, check_target in pairs:
+                ok, detail = _proof(check_target)
+                if not ok:
+                    raise RuntimeError(
+                        "SQLite cohort became live before staged install: "
+                        f"{check_target}: {detail}"
+                    )
+            os.replace(stages[target], target)
+            installed.add(target)
+            _fsync_directory(target.parent)
+
+        installed_checks: dict[str, dict] = {}
+        for _candidate, target in pairs:
+            check = _replacement_integrity_check(
+                target,
+                target,
+                verify_fn=verify_fn,
+            )
+            installed_checks[str(target)] = check
+            if not check.get("valid"):
+                raise RuntimeError(
+                    f"installed {target} failed integrity: "
+                    f"{check.get('message', 'unknown error')}"
+                )
+
+        _write_receipt(
+            "complete",
+            completed_at=datetime.now(timezone.utc).isoformat(),
+            installed_integrity=installed_checks,
+        )
+        return {
+            "applied": True,
+            "deferred": False,
+            "rollback_performed": False,
+            "reason": f"installed {len(pairs)} validated SQLite database(s)",
+            "evidence_dir": str(evidence_dir),
+            "receipt_path": str(receipt_path),
+        }
+    except Exception as exc:
+        rollback_errors = _rollback()
+        rollback_errors.extend(_preserve_stages("failed-staged"))
+        message = f"{reason} failed: {exc}"
+        try:
+            status = (
+                "manual-recovery-required"
+                if any("manual recovery required" in item for item in rollback_errors)
+                else "rolled-back"
+            )
+            _write_receipt(
+                status,
+                error=message,
+                rollback_errors=rollback_errors,
+            )
+        except OSError:
+            pass
+        return {
+            "applied": False,
+            "deferred": False,
+            "rollback_performed": bool(
+                installed or any(moved[target] for target in targets)
+            ) and not rollback_errors,
+            "reason": message,
+            "evidence_dir": str(evidence_dir),
+            "receipt_path": str(receipt_path),
+        }
+
+
+def verify_or_restore_state_db_offline(
+    target: Path,
+    candidate: Path | None,
+    *,
+    reason: str,
+) -> dict[str, Any]:
+    """Verify a live state DB only after proving it has no process owners."""
+
+    from hermes_cli.runtime_ownership import prove_state_db_quiescent
+
+    proof = prove_state_db_quiescent(target)
+    if not proof.quiescent:
+        return {
+            "healthy": False,
+            "applied": False,
+            "deferred": True,
+            "reason": (
+                "state.db integrity verification deferred until the Default "
+                "gateway and dashboard/serve cohort is stopped: "
+                + proof.reason
+            ),
+        }
+    live_check = _replacement_integrity_check(
+        target,
+        target,
+        verify_fn=None,
+    )
+    if live_check.get("valid"):
+        return {
+            "healthy": True,
+            "applied": False,
+            "deferred": False,
+            "reason": str(live_check.get("message") or "integrity check passed"),
+        }
+    if candidate is None or not candidate.exists():
+        return {
+            "healthy": False,
+            "applied": False,
+            "deferred": False,
+            "reason": (
+                f"state.db failed integrity verification "
+                f"({live_check.get('message')}); no recovery candidate exists"
+            ),
+        }
+    restored = replace_sqlite_db_offline(
+        candidate,
+        target,
+        reason=reason,
+    )
+    restored["healthy"] = bool(restored.get("applied"))
+    if not restored.get("applied") and not restored.get("deferred"):
+        restored["reason"] = (
+            f"state.db failed integrity verification "
+            f"({live_check.get('message')}); {restored.get('reason')}"
+        )
+    return restored
+
+
 # ---------------------------------------------------------------------------
 # Backup
 # ---------------------------------------------------------------------------
@@ -510,15 +1389,18 @@ def run_backup(args) -> None:
         sys.exit(1)
 
     # Determine output path
+    auto_named = False
     if args.output:
         out_path = Path(args.output).expanduser().resolve()
         # If user gave a directory, put the zip inside it
         if out_path.is_dir():
             stamp = datetime.now().strftime("%Y-%m-%d-%H%M%S")
             out_path = out_path / f"hermes-backup-{stamp}.zip"
+            auto_named = True
     else:
         stamp = datetime.now().strftime("%Y-%m-%d-%H%M%S")
         out_path = Path.home() / f"hermes-backup-{stamp}.zip"
+        auto_named = True
 
     # Ensure the suffix is .zip
     if out_path.suffix.lower() != ".zip":
@@ -526,6 +1408,8 @@ def run_backup(args) -> None:
 
     # Ensure parent directory exists
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    if auto_named:
+        out_path = _reserve_unique_archive_path(out_path.parent, out_path.name)
 
     # Collect files
     print(f"Scanning {display_hermes_home()} ...")
@@ -583,6 +1467,8 @@ def run_backup(args) -> None:
 
     if not files_to_add and not external_to_add:
         print("No files to back up.")
+        if auto_named:
+            out_path.unlink(missing_ok=True)
         return
 
     # Create the zip
@@ -606,7 +1492,7 @@ def run_backup(args) -> None:
                         suffix=".db", delete=False, dir=str(out_path.parent)
                     ) as tmp:
                         tmp_db = Path(tmp.name)
-                    if _safe_copy_db(abs_path, tmp_db):
+                    if copy_db_and_verify(abs_path, tmp_db):
                         zf.write(tmp_db, arcname=str(rel_path))
                         total_bytes += tmp_db.stat().st_size
                         tmp_db.unlink(missing_ok=True)
@@ -630,8 +1516,24 @@ def run_backup(args) -> None:
         # blobs), so a straight zf.write is fine.
         for abs_path, arcname in external_to_add:
             try:
-                zf.write(abs_path, arcname=arcname)
-                total_bytes += abs_path.stat().st_size
+                if abs_path.suffix == ".db":
+                    with tempfile.NamedTemporaryFile(
+                        suffix=".db", delete=False, dir=str(out_path.parent)
+                    ) as tmp:
+                        tmp_db = Path(tmp.name)
+                    try:
+                        if not copy_db_and_verify(abs_path, tmp_db):
+                            errors.append(
+                                f"  {arcname}: SQLite safe copy failed"
+                            )
+                            continue
+                        zf.write(tmp_db, arcname=arcname)
+                        total_bytes += tmp_db.stat().st_size
+                    finally:
+                        tmp_db.unlink(missing_ok=True)
+                else:
+                    zf.write(abs_path, arcname=arcname)
+                    total_bytes += abs_path.stat().st_size
             except (PermissionError, OSError, ValueError) as exc:
                 errors.append(f"  {arcname}: {exc}")
                 continue
@@ -784,15 +1686,119 @@ def run_import(args) -> None:
                 print("Aborted.")
                 return
 
+        # Preflight and stage every SQLite archive member before writing any
+        # destination file. This covers state.db plus profile, cron, memory,
+        # response, verification, project, and Kanban databases.
+        home_dir = Path.home().resolve()
+        database_members: list[tuple[str, Path]] = []
+        for member in members:
+            if member.startswith(_EXTERNAL_PREFIX):
+                ext_rel = member[len(_EXTERNAL_PREFIX):]
+                if not ext_rel:
+                    continue
+                target = home_dir / ext_rel
+                try:
+                    target.resolve().relative_to(home_dir)
+                except ValueError:
+                    continue
+            else:
+                rel = (
+                    member[len(prefix):]
+                    if prefix and member.startswith(prefix)
+                    else member
+                )
+                if not rel or Path(rel).name in _IMPORT_SKIP_NAMES:
+                    continue
+                target = hermes_root / rel
+                try:
+                    target.resolve().relative_to(hermes_root.resolve())
+                except ValueError:
+                    continue
+            if target.suffix == ".db":
+                database_members.append((member, target))
+
+        database_candidates: list[tuple[Path, Path]] = []
+        import_stage_dir: Path | None = None
+        if database_members:
+            from hermes_cli.runtime_ownership import prove_state_db_quiescent
+
+            for _member, target in database_members:
+                proof = prove_state_db_quiescent(target)
+                if not proof.quiescent:
+                    print(
+                        "Error: refusing database-bearing import while a "
+                        "target SQLite cohort is live or unverified."
+                    )
+                    print(f"  Target: {target}")
+                    print(f"  Reason: {proof.reason}")
+                    print(
+                        "  Stop the matching gateway and dashboard/serve "
+                        "cohort, then retry the import."
+                    )
+                    sys.exit(1)
+
+            stage_base = hermes_root / "backups" / "import-staging"
+            stage_id = (
+                datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+                + f"-{os.getpid()}"
+            )
+            import_stage_dir = stage_base / stage_id
+            import_stage_dir.mkdir(parents=True, exist_ok=False)
+            for index, (member, target) in enumerate(database_members):
+                candidate = import_stage_dir / f"{index:04d}-{target.name}"
+                try:
+                    with zf.open(member) as src, candidate.open("xb") as dst:
+                        shutil.copyfileobj(src, dst)
+                        dst.flush()
+                        os.fsync(dst.fileno())
+                except (OSError, KeyError) as exc:
+                    print(f"Error: could not stage database {member}: {exc}")
+                    sys.exit(1)
+                check = verify_sqlite_integrity(candidate, max_bytes=0)
+                if not check.get("valid"):
+                    print(
+                        f"Error: database {member} failed offline integrity "
+                        f"verification: {check.get('message')}"
+                    )
+                    print(f"  Preserved staging evidence: {import_stage_dir}")
+                    sys.exit(1)
+                database_candidates.append((candidate, target))
+
+            service_guards = {hermes_root / "state.db"}
+            for _candidate, target in database_candidates:
+                try:
+                    relative = target.resolve(strict=False).relative_to(
+                        hermes_root.resolve(strict=False)
+                    )
+                except ValueError:
+                    continue
+                parts = relative.parts
+                if len(parts) >= 3 and parts[0] == "profiles":
+                    service_guards.add(
+                        hermes_root / "profiles" / parts[1] / "state.db"
+                    )
+            db_result = replace_sqlite_db_cohort_offline(
+                database_candidates,
+                reason=f"full backup import {zip_path.name}",
+                evidence_root=(
+                    hermes_root / "backups" / "sqlite-cohort-operations"
+                ),
+                service_guard_paths=sorted(service_guards),
+            )
+            if not db_result.get("applied"):
+                print(f"Error: database import refused: {db_result.get('reason')}")
+                if db_result.get("receipt_path"):
+                    print(f"  Receipt: {db_result['receipt_path']}")
+                sys.exit(1)
+
         # Extract
         print(f"\nImporting {file_count} files ...")
         hermes_root.mkdir(parents=True, exist_ok=True)
 
         errors = []
-        restored = 0
+        restored = len(database_members)
         restored_external = 0
         skipped_runtime: list[str] = []
-        home_dir = Path.home().resolve()
         t0 = time.monotonic()
 
         for member in members:
@@ -809,6 +1815,9 @@ def run_import(args) -> None:
                     target.resolve().relative_to(home_dir)
                 except ValueError:
                     errors.append(f"  {member}: path traversal blocked")
+                    continue
+                if target.suffix == ".db":
+                    restored_external += 1
                     continue
                 try:
                     target.parent.mkdir(parents=True, exist_ok=True)
@@ -855,6 +1864,8 @@ def run_import(args) -> None:
             except ValueError:
                 errors.append(f"  {rel}: path traversal blocked")
                 continue
+            if target.suffix == ".db":
+                continue
 
             try:
                 target.parent.mkdir(parents=True, exist_ok=True)
@@ -870,6 +1881,8 @@ def run_import(args) -> None:
                 print(f"  {restored}/{file_count} files ...")
 
         elapsed = time.monotonic() - t0
+        if import_stage_dir is not None:
+            shutil.rmtree(import_stage_dir, ignore_errors=True)
 
         # Summary
         print()
@@ -1008,6 +2021,21 @@ def _quick_snapshot_root(hermes_home: Optional[Path] = None) -> Path:
     return home / _QUICK_SNAPSHOTS_DIR
 
 
+def _allocate_unique_snapshot_dir(root: Path, base_id: str) -> tuple[str, Path]:
+    """Allocate a non-clobbering snapshot directory."""
+
+    root.mkdir(parents=True, exist_ok=True)
+    for counter in range(10000):
+        snap_id = base_id if counter == 0 else f"{base_id}-{counter}"
+        snap_dir = root / snap_id
+        try:
+            snap_dir.mkdir(parents=False, exist_ok=False)
+            return snap_id, snap_dir
+        except FileExistsError:
+            continue
+    raise OSError(f"could not allocate unique snapshot directory under {root}")
+
+
 def create_quick_snapshot(
     label: Optional[str] = None,
     hermes_home: Optional[Path] = None,
@@ -1058,9 +2086,12 @@ def create_quick_snapshot(
         return True
 
     ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-    snap_id = f"{ts}-{label}" if label else ts
-    snap_dir = root / snap_id
-    snap_dir.mkdir(parents=True, exist_ok=True)
+    base_id = f"{ts}-{label}" if label else ts
+    try:
+        snap_id, snap_dir = _allocate_unique_snapshot_dir(root, base_id)
+    except OSError as exc:
+        logger.error("Could not allocate quick snapshot directory: %s", exc)
+        return None
 
     manifest: Dict[str, int] = {}  # rel_path -> file size
     failed_dbs: list[str] = []  # present *.db that could not be snapshotted
@@ -1069,6 +2100,8 @@ def create_quick_snapshot(
     # to preserve the older complete snapshot that may contain the only
     # recoverable database.
     oversized_skipped: list[str] = []
+    expected_dbs: list[str] = []
+    verified_dbs: list[str] = []
 
     for rel in _QUICK_STATE_FILES:
         src = home / rel
@@ -1088,6 +2121,8 @@ def create_quick_snapshot(
                 # the board databases + their metadata to restore a board.
                 if "/workspaces/" in f"/{sub_rel}/" or "/attachments/" in f"/{sub_rel}/":
                     continue
+                if sub.suffix == ".db":
+                    expected_dbs.append(sub_rel)
                 if _too_large(sub, sub_rel):
                     if sub.suffix == ".db":
                         oversized_skipped.append(sub_rel)
@@ -1099,7 +2134,7 @@ def create_quick_snapshot(
                     # board DB with an open WAL (the gateway may hold it at
                     # snapshot time) is captured consistently.
                     if sub.suffix == ".db":
-                        if not _safe_copy_db(sub, dst):
+                        if not copy_db_and_verify(sub, dst):
                             failed_dbs.append(sub_rel)
                             print(
                                 f"  ⚠ Snapshot: SQLite safe copy FAILED for {sub_rel} "
@@ -1111,6 +2146,7 @@ def create_quick_snapshot(
                                     f"(no SQLite header; {sub.stat().st_size} bytes of NULs?)"
                                 )
                             continue
+                        verified_dbs.append(sub_rel)
                     else:
                         shutil.copy2(sub, dst)
                     manifest[sub_rel] = dst.stat().st_size
@@ -1121,6 +2157,8 @@ def create_quick_snapshot(
         if not src.is_file():
             continue
 
+        if src.suffix == ".db":
+            expected_dbs.append(rel)
         if _too_large(src, rel):
             if src.suffix == ".db":
                 oversized_skipped.append(rel)
@@ -1131,7 +2169,7 @@ def create_quick_snapshot(
 
         try:
             if src.suffix == ".db":
-                if not _safe_copy_db(src, dst):
+                if not copy_db_and_verify(src, dst):
                     failed_dbs.append(rel)
                     print(
                         f"  ⚠ Snapshot: SQLite safe copy FAILED for {rel} "
@@ -1143,6 +2181,7 @@ def create_quick_snapshot(
                             f"(no SQLite header; {src.stat().st_size} bytes)"
                         )
                     continue
+                verified_dbs.append(rel)
             else:
                 shutil.copy2(src, dst)
             manifest[rel] = dst.stat().st_size
@@ -1186,34 +2225,43 @@ def create_quick_snapshot(
         "files": manifest,
         "failed_dbs": failed_dbs,
         "oversized_skipped": oversized_skipped,
+        "expected_dbs": expected_dbs,
+        "verified_dbs": verified_dbs,
+        "verification_status": (
+            "verified"
+            if not failed_dbs
+            and not oversized_skipped
+            and set(expected_dbs) == set(verified_dbs)
+            else "incomplete"
+        ),
     }
-    with open(snap_dir / "manifest.json", "w", encoding="utf-8") as f:
-        json.dump(meta, f, indent=2)
+    atomic_json_write(snap_dir / "manifest.json", meta, indent=2)
+    receipt = {
+        "snapshot_id": snap_id,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "status": meta["verification_status"],
+        "state_bearing": bool(expected_dbs),
+        "expected_dbs": expected_dbs,
+        "verified_dbs": verified_dbs,
+        "failed_dbs": failed_dbs,
+        "oversized_skipped": oversized_skipped,
+        "automatic_retention": "disabled",
+    }
+    atomic_json_write(snap_dir / "verification-receipt.json", receipt, indent=2)
 
-    # Auto-prune. Defaults preserve historical manual /snapshot behavior; callers
-    # with known high-churn safety snapshots (for example pre-update) can pass a
-    # smaller keep value so large state.db copies do not accumulate indefinitely.
-    # #68805 review: skip pruning when a present DB failed to capture OR was
-    # skipped for size — either way the snapshot is incomplete and the older
-    # snapshot may contain the only recoverable database.
-    incomplete = failed_dbs or oversized_skipped
-    if not incomplete:
-        _prune_quick_snapshots(root, keep=_QUICK_DEFAULT_KEEP if keep is None else keep)
-    else:
-        if oversized_skipped:
-            print(
-                "  ⚠ Skipping snapshot prune: DB file(s) skipped for size: "
-                + ", ".join(oversized_skipped)
-            )
-            logger.warning(
-                "Quick snapshot skipped oversized DB file(s): %s",
-                ", ".join(oversized_skipped),
-            )
-        logger.warning(
-            "Skipping snapshot prune because %d DB(s) failed to capture "
-            "and/or %d were oversized — preserving older snapshots as "
-            "recovery source",
-            len(failed_dbs), len(oversized_skipped),
+    # Snapshot creation is append-only. Retention is an explicit operation:
+    # a newly copied but poisoned DB must never delete the last known-good
+    # rollback artifact. ``keep`` remains accepted for API compatibility but
+    # is intentionally not applied here.
+    if oversized_skipped:
+        print(
+            "  ⚠ Snapshot incomplete: DB file(s) skipped for size: "
+            + ", ".join(oversized_skipped)
+        )
+    if keep is not None:
+        logger.info(
+            "Quick snapshot keep=%s recorded but automatic retention is disabled",
+            keep,
         )
 
     logger.info("State snapshot created: %s (%d files)", snap_id, len(manifest))
@@ -1283,7 +2331,8 @@ def restore_quick_snapshot(
     with open(manifest_path, encoding="utf-8") as f:
         meta = json.load(f)
 
-    restored = 0
+    database_replacements: list[tuple[Path, Path]] = []
+    ordinary_files: list[tuple[str, Path, Path]] = []
     for rel in meta.get("files", {}):
         # Security: reject absolute paths and traversals in manifest entries
         src = snap_dir / rel
@@ -1301,19 +2350,39 @@ def restore_quick_snapshot(
             continue
 
         if not src.exists():
+            if dst.suffix == ".db":
+                logger.error("Snapshot database is missing: %s", src)
+                return False
             continue
 
-        dst.parent.mkdir(parents=True, exist_ok=True)
+        if dst.suffix == ".db":
+            database_replacements.append((src, dst))
+        else:
+            ordinary_files.append((rel, src, dst))
 
+    # Every database in the manifest is preflighted before any target file is
+    # written. A single live/unknown owner refuses the entire restore; all DBs
+    # then apply as one rollback-backed cohort.
+    restored = 0
+    if database_replacements:
+        db_result = replace_sqlite_db_cohort_offline(
+            database_replacements,
+            reason=f"quick snapshot restore {snapshot_id}",
+            evidence_root=home / "backups" / "sqlite-cohort-operations",
+            service_guard_paths=[home / "state.db"],
+        )
+        if not db_result.get("applied"):
+            logger.error(
+                "Refused quick snapshot database restore: %s",
+                db_result.get("reason"),
+            )
+            return False
+        restored += len(database_replacements)
+
+    for rel, src, dst in ordinary_files:
+        dst.parent.mkdir(parents=True, exist_ok=True)
         try:
-            if dst.suffix == ".db":
-                # Atomic-ish replace for databases
-                tmp = dst.parent / f".{dst.name}.snap_restore"
-                shutil.copy2(src, tmp)
-                dst.unlink(missing_ok=True)
-                shutil.move(str(tmp), str(dst))
-            else:
-                shutil.copy2(src, dst)
+            shutil.copy2(src, dst)
             restored += 1
         except (OSError, PermissionError) as exc:
             logger.error("Failed to restore %s: %s", rel, exc)
@@ -1514,6 +2583,7 @@ def _write_full_zip_backup(out_path: Path, hermes_root: Path) -> Optional[Path]:
         return None
 
     sqlite_snapshot_failed = False
+    verified_databases: list[str] = []
     try:
         with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
             for abs_path, rel_path in files_to_add:
@@ -1528,7 +2598,7 @@ def _write_full_zip_backup(out_path: Path, hermes_root: Path) -> Optional[Path]:
                         ) as tmp:
                             tmp_db = Path(tmp.name)
                         try:
-                            if not _safe_copy_db(abs_path, tmp_db):
+                            if not copy_db_and_verify(abs_path, tmp_db):
                                 logger.warning(
                                     "Full-zip backup aborted: SQLite snapshot failed for %s",
                                     rel_path,
@@ -1536,6 +2606,7 @@ def _write_full_zip_backup(out_path: Path, hermes_root: Path) -> Optional[Path]:
                                 sqlite_snapshot_failed = True
                                 break
                             zf.write(tmp_db, arcname=str(rel_path))
+                            verified_databases.append(str(rel_path))
                         finally:
                             tmp_db.unlink(missing_ok=True)
                     else:
@@ -1559,7 +2630,51 @@ def _write_full_zip_backup(out_path: Path, hermes_root: Path) -> Optional[Path]:
             pass
         return None
 
+    receipt = {
+        "archive": str(out_path),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "status": "verified",
+        "verified_databases": verified_databases,
+        "automatic_retention": "disabled",
+    }
+    try:
+        atomic_json_write(
+            out_path.with_suffix(out_path.suffix + ".receipt.json"),
+            receipt,
+            indent=2,
+        )
+    except OSError as exc:
+        logger.warning("Full-zip backup receipt write failed: %s", exc)
+        return None
     return out_path
+
+
+def _reserve_unique_archive_path(
+    directory: Path,
+    base_name: str,
+) -> Path:
+    """Reserve a unique archive filename without clobbering a prior run."""
+
+    directory.mkdir(parents=True, exist_ok=True)
+    base = Path(base_name)
+    for counter in range(10000):
+        name = (
+            base.name
+            if counter == 0
+            else f"{base.stem}-{counter}{base.suffix}"
+        )
+        candidate = directory / name
+        try:
+            fd = os.open(
+                candidate,
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                0o600,
+            )
+        except FileExistsError:
+            continue
+        os.close(fd)
+        return candidate
+    raise OSError(f"could not reserve unique archive path under {directory}")
 
 
 # ---------------------------------------------------------------------------
@@ -1639,13 +2754,24 @@ def create_pre_update_backup(
         return None
 
     stamp = datetime.now().strftime("%Y-%m-%d-%H%M%S")
-    out_path = backup_dir / f"{_PRE_UPDATE_PREFIX}{stamp}.zip"
+    try:
+        out_path = _reserve_unique_archive_path(
+            backup_dir,
+            f"{_PRE_UPDATE_PREFIX}{stamp}.zip",
+        )
+    except OSError as exc:
+        logger.warning("Could not reserve pre-update backup path: %s", exc)
+        return None
 
     result = _write_full_zip_backup(out_path, hermes_root)
     if result is None:
+        out_path.unlink(missing_ok=True)
         return None
 
-    _prune_pre_update_backups(backup_dir, keep=keep)
+    logger.info(
+        "Pre-update backup keep=%s recorded but automatic retention is disabled",
+        keep,
+    )
     return out_path
 
 
@@ -1716,11 +2842,22 @@ def create_pre_migration_backup(
         return None
 
     stamp = datetime.now().strftime("%Y-%m-%d-%H%M%S")
-    out_path = backup_dir / f"{_PRE_MIGRATION_PREFIX}{stamp}.zip"
+    try:
+        out_path = _reserve_unique_archive_path(
+            backup_dir,
+            f"{_PRE_MIGRATION_PREFIX}{stamp}.zip",
+        )
+    except OSError as exc:
+        logger.warning("Could not reserve pre-migration backup path: %s", exc)
+        return None
 
     result = _write_full_zip_backup(out_path, hermes_root)
     if result is None:
+        out_path.unlink(missing_ok=True)
         return None
 
-    _prune_pre_migration_backups(backup_dir, keep=keep)
+    logger.info(
+        "Pre-migration backup keep=%s recorded but automatic retention is disabled",
+        keep,
+    )
     return out_path

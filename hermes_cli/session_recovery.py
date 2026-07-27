@@ -252,9 +252,17 @@ def _copy_source_bundle(source: Path, snapshot_dir: Path) -> tuple[Path, list[st
     keeps this path consistent with ``hermes_state._backup_db_file``.
     """
     from hermes_cli.sqlite_safe_read import LiveConnectionError, offline_file_access
+    from hermes_cli.runtime_ownership import prove_state_db_quiescent
 
     snapshot_source = snapshot_dir / source.name
     copied: list[str] = []
+    proof = prove_state_db_quiescent(source)
+    if not proof.quiescent:
+        raise SessionRecoverySafetyError(
+            "Refusing to copy recovery source while another process or "
+            f"managed service can own it: {proof.reason}"
+        )
+    before = _source_fingerprint(source)
     try:
         with offline_file_access(source, what="snapshot"):
             for suffix in _SIDECAR_SUFFIXES:
@@ -266,6 +274,12 @@ def _copy_source_bundle(source: Path, snapshot_dir: Path) -> tuple[Path, list[st
                 copied.append(destination_part.name)
     except LiveConnectionError as exc:
         raise SessionRecoverySafetyError(str(exc)) from exc
+    proof = prove_state_db_quiescent(source)
+    if not proof.quiescent or _source_fingerprint(source) != before:
+        raise SessionRecoverySafetyError(
+            "Recovery source changed or became live while its bundle was "
+            "copied; preserved the disposable copy but refusing to inspect it."
+        )
     return snapshot_source, copied
 
 

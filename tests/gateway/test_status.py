@@ -461,6 +461,29 @@ class TestGatewayRuntimeStatus:
         assert payload["pid"] == os.getpid()
         assert payload["start_time"] == 2000
 
+    def test_write_runtime_status_exposes_boot_and_disk_source_revision(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setattr(
+            status,
+            "_runtime_source_status",
+            lambda: {
+                "boot_revision": "abc1234567",
+                "disk_revision": "def7654321",
+                "code_skew": True,
+            },
+        )
+
+        status.write_runtime_status(gateway_state="running")
+
+        payload = status.read_runtime_status()
+        assert payload["source"] == {
+            "boot_revision": "abc1234567",
+            "disk_revision": "def7654321",
+            "code_skew": True,
+        }
+
     def test_runtime_status_running_pid_rejects_stale_record_for_supervisor_pid(self, monkeypatch):
         """Regression: stale profile runtime state must not mark s6 supervisors live.
 

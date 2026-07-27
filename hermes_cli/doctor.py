@@ -695,6 +695,190 @@ def managed_scope_check() -> None:
         check_info(f"managed dir set via HERMES_MANAGED_DIR={managed_dir}")
 
 
+_STATE_DB_OWNERSHIP_UNKNOWN = "unknown"
+_STATE_DB_OWNERSHIP_UNSAFE = "unsafe"
+_STATE_DB_OWNERSHIP_LIVE = "coherent-live"
+_STATE_DB_OWNERSHIP_QUIESCENT = "quiescent"
+
+
+def _record_unknown_state_db_ownership(manual_issues: list[str]) -> None:
+    issue = (
+        "State.db ownership could not be inspected; stop the gateway and "
+        "dashboard/serve cohort, restore lsof/psutil inspection, and rerun "
+        "`hermes doctor` before treating persistence as healthy."
+    )
+    if issue not in manual_issues:
+        manual_issues.append(issue)
+
+
+def _record_deferred_state_db_write_health(manual_issues: list[str]) -> None:
+    issue = (
+        "State.db write health was not verified because live owners were "
+        "active; stop the gateway and dashboard/serve cohort and rerun "
+        "`hermes doctor` before treating persistence as fully healthy."
+    )
+    if issue not in manual_issues:
+        manual_issues.append(issue)
+
+
+def _check_state_db_runtime_ownership(
+    state_db_path: Path,
+    manual_issues: list[str],
+) -> str:
+    """Report split/unlinked SQLite generations and stale long-lived owners.
+
+    This check is deliberately read-only. A live WAL generation must never be
+    checkpointed, renamed, or "repaired" by Doctor; the only safe remediation
+    is to quiesce every owner and restart the gateway/dashboard cohort. The
+    return value distinguishes a coherent live generation from a quiescent
+    database so callers can permit read-only checks without permitting writes.
+    """
+    try:
+        from hermes_cli.runtime_ownership import (
+            inspect_state_db_ownership,
+            summarize_state_db_owners,
+        )
+
+        report = inspect_state_db_ownership(state_db_path)
+    except Exception as exc:
+        check_warn("state.db runtime ownership probe failed", f"({exc})")
+        _record_unknown_state_db_ownership(manual_issues)
+        return _STATE_DB_OWNERSHIP_UNKNOWN
+
+    if not report.available:
+        detail = report.errors[0] if report.errors else "lsof unavailable"
+        check_warn(
+            "state.db runtime ownership not inspectable",
+            f"({detail})",
+        )
+        _record_unknown_state_db_ownership(manual_issues)
+        return _STATE_DB_OWNERSHIP_UNKNOWN
+
+    owners = summarize_state_db_owners(report, home=state_db_path.parent)
+    if not owners:
+        check_ok("state.db runtime ownership", "(no live process owners)")
+        return _STATE_DB_OWNERSHIP_QUIESCENT
+
+    hazards: list[str] = []
+    if report.split_kinds:
+        split = ", ".join(
+            f"{kind}={','.join(str(inode) for inode in sorted(inodes))}"
+            for kind, inodes in sorted(report.split_kinds.items())
+        )
+        hazards.append(f"split inode generations ({split})")
+    if report.foreign_inodes:
+        foreign = ", ".join(
+            f"{kind}={','.join(str(inode) for inode in sorted(inodes))}"
+            for kind, inodes in sorted(report.foreign_inodes.items())
+        )
+        hazards.append(f"open inode differs from linked path ({foreign})")
+    if report.unlinked_files:
+        unlinked = ", ".join(
+            f"PID {item.pid} {item.kind}:{item.inode or '?'}"
+            for item in report.unlinked_files[:6]
+        )
+        if len(report.unlinked_files) > 6:
+            unlinked += f", +{len(report.unlinked_files) - 6} more"
+        hazards.append(f"unlinked open sidecars ({unlinked})")
+
+    stale_owners = [owner for owner in owners if owner.stale_revision]
+    if stale_owners:
+        hazards.append(
+            "stale source owners ("
+            + ", ".join(
+                f"PID {owner.pid} {owner.role} "
+                f"{owner.boot_revision}->{owner.disk_revision}"
+                for owner in stale_owners
+            )
+            + ")"
+        )
+
+    if hazards:
+        check_fail(
+            "state.db runtime ownership is unsafe",
+            f"({'; '.join(hazards)})",
+        )
+        issue = (
+            "Quiesce every process that owns state.db, then restart the "
+            "gateway and dashboard/serve backend as one coordinated cohort; "
+            "rerun `hermes doctor` before resuming writes."
+        )
+        if issue not in manual_issues:
+            manual_issues.append(issue)
+    else:
+        check_ok(
+            "state.db runtime ownership is coherent",
+            f"({len(owners)} process owner(s), one linked WAL/SHM generation)",
+        )
+
+    for owner in owners:
+        revision = (
+            f"source {owner.boot_revision}"
+            if owner.boot_revision
+            else "source revision unavailable"
+        )
+        check_info(f"PID {owner.pid} {owner.role}: {revision}")
+
+    unknown_long_lived = [
+        owner
+        for owner in owners
+        if owner.role in {"gateway", "dashboard", "serve"}
+        and owner.boot_revision is None
+    ]
+    if unknown_long_lived:
+        check_warn(
+            "Long-lived state.db owner revision unavailable",
+            "(restart the affected process once to adopt runtime identity metadata)",
+        )
+
+    if hazards:
+        return _STATE_DB_OWNERSHIP_UNSAFE
+    return _STATE_DB_OWNERSHIP_LIVE
+
+
+def _state_db_mutation_allowed(
+    ownership_status: str,
+    operation: str,
+    manual_issues: list[str],
+    *,
+    state_db_path: Path | None = None,
+) -> bool:
+    """Fail closed unless ownership was inspected and no process owns the DB."""
+    if ownership_status == _STATE_DB_OWNERSHIP_QUIESCENT:
+        if state_db_path is None:
+            return True
+        try:
+            from hermes_cli.runtime_ownership import inspect_state_db_ownership
+
+            current = inspect_state_db_ownership(state_db_path)
+            if current.available and not current.pids:
+                return True
+            ownership_status = (
+                _STATE_DB_OWNERSHIP_LIVE
+                if current.available and current.pids
+                else _STATE_DB_OWNERSHIP_UNKNOWN
+            )
+        except Exception:
+            ownership_status = _STATE_DB_OWNERSHIP_UNKNOWN
+
+    if ownership_status == _STATE_DB_OWNERSHIP_LIVE:
+        reason = "live state.db owner(s) must be stopped first"
+    elif ownership_status == _STATE_DB_OWNERSHIP_UNSAFE:
+        reason = "runtime ownership is unsafe"
+    else:
+        reason = "runtime ownership could not be proven quiescent"
+    check_warn(f"Skipped {operation}", f"({reason})")
+
+    issue = (
+        "Stop the gateway and dashboard/serve backend as one coordinated "
+        "cohort, confirm state.db has no live owners, then rerun "
+        "`hermes doctor --fix`."
+    )
+    if issue not in manual_issues:
+        manual_issues.append(issue)
+    return False
+
+
 def run_doctor(args):
     """Run diagnostic checks."""
     should_fix = getattr(args, 'fix', False)
@@ -1480,102 +1664,167 @@ def run_doctor(args):
     
     # Check SQLite session store
     state_db_path = hermes_home / "state.db"
+    state_db_ownership = _STATE_DB_OWNERSHIP_UNKNOWN
     if state_db_path.exists():
-        try:
-            import sqlite3
-            conn = sqlite3.connect(str(state_db_path))
-            cursor = conn.execute("SELECT COUNT(*) FROM sessions")
-            count = cursor.fetchone()[0]
-            conn.close()
-            check_ok(f"{_DHH}/state.db exists ({count} sessions)")
+        state_db_ownership = _check_state_db_runtime_ownership(
+            state_db_path,
+            manual_issues,
+        )
+        if state_db_ownership in {
+            _STATE_DB_OWNERSHIP_UNSAFE,
+            _STATE_DB_OWNERSHIP_UNKNOWN,
+        }:
+            reason = (
+                "unsafe runtime ownership"
+                if state_db_ownership == _STATE_DB_OWNERSHIP_UNSAFE
+                else "runtime ownership could not be inspected"
+            )
+            check_warn(
+                "Skipped state.db content probes",
+                f"({reason}; quiesce the database cohort first)",
+            )
+        else:
+            try:
+                import sqlite3
+                if state_db_ownership == _STATE_DB_OWNERSHIP_LIVE:
+                    conn = sqlite3.connect(
+                        f"{state_db_path.resolve().as_uri()}?mode=ro",
+                        uri=True,
+                    )
+                else:
+                    conn = sqlite3.connect(str(state_db_path))
+                try:
+                    cursor = conn.execute("SELECT COUNT(*) FROM sessions")
+                    count = cursor.fetchone()[0]
+                finally:
+                    conn.close()
+                check_ok(f"{_DHH}/state.db exists ({count} sessions)")
 
-            # FTS write-health probe (#50502): `SELECT COUNT(*)` above succeeds
-            # even when the FTS index is corrupt and every message write fails
-            # through the triggers. `_db_opens_cleanly` now drives a rolled-back
-            # write so this otherwise-silent corruption class is surfaced (and
-            # repaired in place with --fix).
-            from hermes_state import _db_opens_cleanly, repair_state_db_schema
+                # FTS write-health probe (#50502): `SELECT COUNT(*)` above
+                # succeeds even when the FTS index is corrupt and every message
+                # write fails through the triggers. This probe drives a
+                # rolled-back write, so only run it while the DB is quiescent.
+                if state_db_ownership == _STATE_DB_OWNERSHIP_QUIESCENT:
+                    from hermes_state import (
+                        _db_opens_cleanly,
+                        repair_state_db_schema,
+                    )
 
-            _write_reason = _db_opens_cleanly(state_db_path)
-            if _write_reason is not None:
-                check_warn(
-                    f"{_DHH}/state.db fails a write-health probe (FTS index may be corrupt)",
-                    f"({_write_reason})",
-                )
-                if should_fix:
-                    report = repair_state_db_schema(state_db_path)
-                    if report.get("repaired"):
-                        backup_name = (
-                            Path(report["backup_path"]).name
-                            if report.get("backup_path") else "n/a"
-                        )
-                        check_ok(
-                            "Repaired state.db FTS write health",
-                            f"(strategy: {report.get('strategy')}; backup: {backup_name})",
-                        )
-                        fixed_count += 1
-                    else:
+                    _write_reason = _db_opens_cleanly(state_db_path)
+                    if _write_reason is not None:
                         check_warn(
-                            "state.db FTS write-health repair did not recover automatically",
-                            f"({report.get('error')}; backup: {report.get('backup_path')})",
+                            f"{_DHH}/state.db fails a write-health probe "
+                            "(FTS index may be corrupt)",
+                            f"({_write_reason})",
                         )
+                        if should_fix and _state_db_mutation_allowed(
+                            state_db_ownership,
+                            "state.db FTS write-health repair",
+                            manual_issues,
+                            state_db_path=state_db_path,
+                        ):
+                            report = repair_state_db_schema(state_db_path)
+                            if report.get("repaired"):
+                                backup_name = (
+                                    Path(report["backup_path"]).name
+                                    if report.get("backup_path")
+                                    else "n/a"
+                                )
+                                check_ok(
+                                    "Repaired state.db FTS write health",
+                                    f"(strategy: {report.get('strategy')}; "
+                                    f"backup: {backup_name})",
+                                )
+                                fixed_count += 1
+                            else:
+                                check_warn(
+                                    "state.db FTS write-health repair did not "
+                                    "recover automatically",
+                                    f"({report.get('error')}; "
+                                    f"backup: {report.get('backup_path')})",
+                                )
+                                issues.append(
+                                    "state.db FTS write corruption and "
+                                    "auto-repair failed — restore from the "
+                                    "backup copy beside state.db"
+                                )
+                        elif not should_fix:
+                            issues.append(
+                                "state.db FTS write corruption — run "
+                                "'hermes doctor --fix' (or "
+                                "'hermes sessions repair') to rebuild the FTS "
+                                "index"
+                            )
+                else:
+                    check_info(
+                        "Skipped state.db write-health probe "
+                        "(requires zero live owners)"
+                    )
+                    _record_deferred_state_db_write_health(manual_issues)
+            except Exception as e:
+                from hermes_state import is_malformed_db_error, repair_state_db_schema
+
+                if is_malformed_db_error(e):
+                    # sqlite_master itself is malformed (e.g. duplicate
+                    # messages_fts) — every statement fails before it runs, so
+                    # this is NOT a plain FTS-index rebuild. Repair sqlite_master
+                    # in place (backup first; sessions/messages preserved).
+                    check_warn(
+                        f"{_DHH}/state.db schema is malformed "
+                        "(sessions hidden until repaired)",
+                        f"({e})",
+                    )
+                    if should_fix and _state_db_mutation_allowed(
+                        state_db_ownership,
+                        "state.db schema repair",
+                        manual_issues,
+                        state_db_path=state_db_path,
+                    ):
+                        report = repair_state_db_schema(state_db_path)
+                        if report.get("repaired"):
+                            try:
+                                conn = sqlite3.connect(str(state_db_path))
+                                try:
+                                    count = conn.execute(
+                                        "SELECT COUNT(*) FROM sessions"
+                                    ).fetchone()[0]
+                                finally:
+                                    conn.close()
+                            except Exception:
+                                count = "?"
+                            backup_name = (
+                                Path(report["backup_path"]).name
+                                if report.get("backup_path")
+                                else "n/a"
+                            )
+                            check_ok(
+                                f"Repaired state.db schema "
+                                f"({count} sessions recovered)",
+                                f"(strategy: {report.get('strategy')}; "
+                                f"backup: {backup_name})",
+                            )
+                            fixed_count += 1
+                        else:
+                            check_warn(
+                                "state.db schema repair did not recover "
+                                "automatically",
+                                f"({report.get('error')}; "
+                                f"backup: {report.get('backup_path')})",
+                            )
+                            issues.append(
+                                "state.db schema malformed and auto-repair "
+                                "failed — restore from the backup copy beside "
+                                "state.db"
+                            )
+                    elif not should_fix:
                         issues.append(
-                            "state.db FTS write corruption and auto-repair failed — "
-                            "restore from the backup copy beside state.db"
+                            "state.db schema malformed — run "
+                            "'hermes doctor --fix' (or "
+                            "'hermes sessions repair') to recover hidden "
+                            "sessions"
                         )
                 else:
-                    issues.append(
-                        "state.db FTS write corruption — run 'hermes doctor --fix' "
-                        "(or 'hermes sessions repair') to rebuild the FTS index"
-                    )
-        except Exception as e:
-            from hermes_state import is_malformed_db_error, repair_state_db_schema
-
-            if is_malformed_db_error(e):
-                # sqlite_master itself is malformed (e.g. duplicate
-                # messages_fts) — every statement fails before it runs, so
-                # this is NOT a plain FTS-index rebuild. Repair sqlite_master
-                # in place (backup first; sessions/messages preserved).
-                check_warn(
-                    f"{_DHH}/state.db schema is malformed (sessions hidden until repaired)",
-                    f"({e})",
-                )
-                if should_fix:
-                    report = repair_state_db_schema(state_db_path)
-                    if report.get("repaired"):
-                        try:
-                            conn = sqlite3.connect(str(state_db_path))
-                            count = conn.execute(
-                                "SELECT COUNT(*) FROM sessions"
-                            ).fetchone()[0]
-                            conn.close()
-                        except Exception:
-                            count = "?"
-                        backup_name = (
-                            Path(report["backup_path"]).name
-                            if report.get("backup_path") else "n/a"
-                        )
-                        check_ok(
-                            f"Repaired state.db schema ({count} sessions recovered)",
-                            f"(strategy: {report.get('strategy')}; backup: {backup_name})",
-                        )
-                        fixed_count += 1
-                    else:
-                        check_warn(
-                            "state.db schema repair did not recover automatically",
-                            f"({report.get('error')}; backup: {report.get('backup_path')})",
-                        )
-                        issues.append(
-                            "state.db schema malformed and auto-repair failed — "
-                            "restore from the backup copy beside state.db"
-                        )
-                else:
-                    issues.append(
-                        "state.db schema malformed — run 'hermes doctor --fix' "
-                        "(or 'hermes sessions repair') to recover hidden sessions"
-                    )
-            else:
-                check_warn(f"{_DHH}/state.db exists but has issues: {e}")
+                    check_warn(f"{_DHH}/state.db exists but has issues: {e}")
     else:
         check_info(f"{_DHH}/state.db not created yet (will be created on first session)")
 
@@ -1589,15 +1838,22 @@ def run_doctor(args):
                     f"WAL file is large ({wal_size // (1024*1024)} MB)",
                     "(may indicate missed checkpoints)"
                 )
-                if should_fix:
+                if should_fix and _state_db_mutation_allowed(
+                    state_db_ownership,
+                    "state.db WAL checkpoint",
+                    manual_issues,
+                    state_db_path=state_db_path,
+                ):
                     import sqlite3
                     conn = sqlite3.connect(str(state_db_path))
-                    conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-                    conn.close()
+                    try:
+                        conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                    finally:
+                        conn.close()
                     new_size = wal_path.stat().st_size if wal_path.exists() else 0
                     check_ok(f"WAL checkpoint performed ({wal_size // 1024}K → {new_size // 1024}K)")
                     fixed_count += 1
-                else:
+                elif not should_fix:
                     issues.append("Large WAL file — run 'hermes doctor --fix' to checkpoint")
             elif wal_size > 10 * 1024 * 1024:  # 10 MB
                 check_info(f"WAL file is {wal_size // (1024*1024)} MB (normal for active sessions)")

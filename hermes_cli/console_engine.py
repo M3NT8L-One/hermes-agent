@@ -1489,6 +1489,14 @@ def _sessions_repair(_engine: HermesConsoleEngine, args: list[str]) -> str:
         if not db_path.exists():
             print(f"No session database at {db_path} (nothing to repair).")
             return
+        from hermes_cli.runtime_ownership import prove_state_db_quiescent
+
+        proof = prove_state_db_quiescent(db_path)
+        if not proof.quiescent:
+            raise ConsoleCommandError(
+                "Refusing to inspect or repair state.db until the gateway and "
+                f"dashboard/serve cohort is stopped/unloaded: {proof.reason}"
+            )
         reason = _db_opens_cleanly(db_path)
         if reason is None:
             print(f"{db_path} opens cleanly; no repair needed.")

@@ -627,7 +627,10 @@ def test_recovery_refuses_to_snapshot_a_live_database(tmp_path: Path) -> None:
 
     live = connect_tracked(source, isolation_level=None)
     try:
-        with pytest.raises(SessionRecoverySafetyError, match="still open"):
+        with pytest.raises(
+            SessionRecoverySafetyError,
+            match="live SQLite owner",
+        ):
             recover_session_database(source, output, work_dir=tmp_path)
     finally:
         live.close()
@@ -1143,4 +1146,5 @@ def test_failed_repair_points_the_user_at_offline_recovery(tmp_path: Path) -> No
     assert "--inspect-only" in combined, combined
     # It must offer the source it actually preserved, not a placeholder.
     assert "--source" in combined, combined
-    assert "malformed-backup" in combined, combined
+    assert "state-db-repair-candidates" in combined, combined
+    assert "--source" in combined and "state.db" in combined

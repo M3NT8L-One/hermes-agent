@@ -6,10 +6,19 @@ issue #68474 (file kept at original size, 100% null bytes, header gone).
 """
 
 import sqlite3
+import hashlib
+import json
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from hermes_cli.backup import copy_db_and_verify, verify_sqlite_integrity
+from hermes_cli.backup import (
+    copy_db_and_verify,
+    replace_sqlite_db_cohort_offline,
+    replace_sqlite_db_offline,
+    verify_sqlite_integrity,
+)
 
 
 @pytest.fixture()
@@ -162,6 +171,233 @@ def test_restore_flow_end_to_end(valid_db, tmp_path):
     conn = sqlite3.connect(valid_db)
     assert conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 50
     conn.close()
+
+
+def _quiescent(_path):
+    return SimpleNamespace(quiescent=True, reason="test cohort offline")
+
+
+def _cohort_hashes(path: Path) -> dict[str, str]:
+    result = {}
+    for suffix in ("", "-wal", "-shm", "-journal"):
+        member = Path(f"{path}{suffix}")
+        if member.exists():
+            result[suffix or "main"] = hashlib.sha256(
+                member.read_bytes()
+            ).hexdigest()
+    return result
+
+
+def _value_db(path: Path, value: str) -> None:
+    with sqlite3.connect(path) as conn:
+        conn.execute("CREATE TABLE value_store (value TEXT)")
+        conn.execute("INSERT INTO value_store VALUES (?)", (value,))
+
+
+def test_offline_replace_normalizes_wal_and_preserves_source_exactly(tmp_path):
+    source = tmp_path / "source.db"
+    writer = sqlite3.connect(source)
+    writer.execute("PRAGMA journal_mode=WAL")
+    writer.execute("PRAGMA wal_autocheckpoint=0")
+    writer.execute("CREATE TABLE value_store (value TEXT)")
+    writer.execute("INSERT INTO value_store VALUES ('committed-in-wal')")
+    writer.commit()
+    before = _cohort_hashes(source)
+    assert "-wal" in before
+
+    target = tmp_path / "target.db"
+    _value_db(target, "old")
+    result = replace_sqlite_db_offline(
+        source,
+        target,
+        reason="wal normalization regression",
+        quiescence_fn=_quiescent,
+    )
+    try:
+        assert result["applied"] is True, result
+        with sqlite3.connect(target) as conn:
+            assert conn.execute("SELECT value FROM value_store").fetchall() == [
+                ("committed-in-wal",)
+            ]
+        assert _cohort_hashes(source) == before
+        assert not list(tmp_path.glob(".*.staged-*"))
+    finally:
+        writer.close()
+
+
+def test_offline_replace_rolls_back_exact_cohort_on_second_move_failure(
+    tmp_path, monkeypatch
+):
+    from hermes_cli import backup
+
+    source = tmp_path / "source.db"
+    _value_db(source, "new")
+    target = tmp_path / "target.db"
+    _value_db(target, "old")
+    Path(f"{target}-wal").write_bytes(b"old-wal")
+    Path(f"{target}-shm").write_bytes(b"old-shm")
+    before = {
+        suffix: Path(f"{target}{suffix}").read_bytes()
+        for suffix in ("", "-wal", "-shm")
+    }
+    real_replace = backup.os.replace
+    failed = False
+
+    def fail_second_member(src, dst):
+        nonlocal failed
+        if Path(src) == Path(f"{target}-wal") and not failed:
+            failed = True
+            raise OSError("injected WAL move failure")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(backup.os, "replace", fail_second_member)
+    result = replace_sqlite_db_offline(
+        source,
+        target,
+        reason="move failure regression",
+        verify_fn=lambda _path: {"valid": True, "message": "ok"},
+        quiescence_fn=_quiescent,
+    )
+
+    assert result["applied"] is False
+    assert result["rollback_performed"] is True
+    assert {
+        suffix: Path(f"{target}{suffix}").read_bytes()
+        for suffix in ("", "-wal", "-shm")
+    } == before
+
+
+def test_installed_verification_failure_rolls_back_original(tmp_path):
+    source = tmp_path / "source.db"
+    _value_db(source, "new")
+    target = tmp_path / "target.db"
+    _value_db(target, "old")
+
+    def verifier(path):
+        if Path(path) == target:
+            return {"valid": False, "message": "injected installed failure"}
+        return {"valid": True, "message": "ok"}
+
+    result = replace_sqlite_db_offline(
+        source,
+        target,
+        reason="installed verification regression",
+        verify_fn=verifier,
+        quiescence_fn=_quiescent,
+    )
+
+    assert result["rollback_performed"] is True
+    with sqlite3.connect(target) as conn:
+        assert conn.execute("SELECT value FROM value_store").fetchone() == (
+            "old",
+        )
+    receipt = json.loads(Path(result["receipt_path"]).read_text())
+    assert receipt["status"] == "rolled-back"
+
+
+def test_owner_appearance_before_install_requires_manual_recovery(tmp_path):
+    source = tmp_path / "source.db"
+    _value_db(source, "new")
+    target = tmp_path / "target.db"
+    _value_db(target, "old")
+    target_calls = 0
+
+    def ownership(path):
+        nonlocal target_calls
+        if Path(path) == target:
+            target_calls += 1
+            offline = target_calls <= 2
+            return SimpleNamespace(
+                quiescent=offline,
+                reason="offline" if offline else "owner appeared",
+            )
+        return _quiescent(path)
+
+    result = replace_sqlite_db_offline(
+        source,
+        target,
+        reason="owner appearance regression",
+        verify_fn=lambda _path: {"valid": True, "message": "ok"},
+        quiescence_fn=ownership,
+    )
+
+    assert result["applied"] is False
+    assert result["rollback_performed"] is False
+    receipt = json.loads(Path(result["receipt_path"]).read_text())
+    assert receipt["status"] == "manual-recovery-required"
+    assert Path(result["evidence_dir"], "original-target.db").exists()
+
+
+def test_replacement_integrity_forces_full_check(tmp_path, monkeypatch):
+    from hermes_cli import backup
+
+    path = tmp_path / "generic.db"
+    _value_db(path, "x")
+    calls = []
+
+    def verifier(_path, **kwargs):
+        calls.append(kwargs)
+        return {"valid": True, "message": "ok"}
+
+    monkeypatch.setattr(backup, "verify_sqlite_integrity", verifier)
+    result = backup._replacement_integrity_check(
+        path,
+        tmp_path / "generic-target.db",
+        verify_fn=None,
+    )
+    assert result["valid"] is True
+    assert calls == [{"max_bytes": 0}]
+
+
+def test_cohort_service_guard_refuses_non_state_db_before_mutation(tmp_path):
+    source = tmp_path / "source-kanban.db"
+    _value_db(source, "new")
+    target = tmp_path / "kanban.db"
+    _value_db(target, "old")
+    guard = tmp_path / "state.db"
+
+    def ownership(path):
+        if Path(path) == guard:
+            return SimpleNamespace(
+                quiescent=False,
+                reason="gateway launchd service loaded",
+            )
+        return _quiescent(path)
+
+    result = replace_sqlite_db_cohort_offline(
+        [(source, target)],
+        reason="service guard regression",
+        evidence_root=tmp_path / "evidence",
+        service_guard_paths=[guard],
+        verify_fn=lambda _path: {"valid": True, "message": "ok"},
+        quiescence_fn=ownership,
+    )
+
+    assert result["deferred"] is True
+    with sqlite3.connect(target) as conn:
+        assert conn.execute("SELECT value FROM value_store").fetchone() == (
+            "old",
+        )
+
+
+def test_offline_replace_installs_exact_candidate_when_target_is_absent(tmp_path):
+    source = tmp_path / "source.db"
+    _value_db(source, "recovered")
+    target = tmp_path / "missing.db"
+
+    result = replace_sqlite_db_offline(
+        source,
+        target,
+        reason="missing target recovery",
+        quiescence_fn=_quiescent,
+    )
+
+    assert result["applied"] is True
+    assert (target.stat().st_mode & 0o777) == 0o600
+    with sqlite3.connect(target) as conn:
+        assert conn.execute("SELECT value FROM value_store").fetchone() == (
+            "recovered",
+        )
 
 
 class TestPreUpdateBackupIntegrityGuard:

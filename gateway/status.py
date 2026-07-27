@@ -576,6 +576,20 @@ def _build_pid_record() -> dict:
     }
 
 
+def _runtime_source_status() -> dict[str, str | bool | None]:
+    """Return this process's boot/disk source revision, best-effort."""
+    try:
+        from gateway.code_skew import source_revision_status
+
+        return source_revision_status()
+    except Exception:
+        return {
+            "boot_revision": None,
+            "disk_revision": None,
+            "code_skew": None,
+        }
+
+
 def _build_runtime_status_record() -> dict[str, Any]:
     payload = _build_pid_record()
     payload.update({
@@ -584,6 +598,7 @@ def _build_runtime_status_record() -> dict[str, Any]:
         "restart_requested": False,
         "active_agents": 0,
         "platforms": {},
+        "source": _runtime_source_status(),
         "updated_at": _utc_now_iso(),
     })
     return payload
@@ -994,6 +1009,11 @@ def write_runtime_status(
     payload["pid"] = current_record["pid"]
     payload["argv"] = current_record["argv"]
     payload["start_time"] = current_record["start_time"]
+    # Refresh the disk side on every status write while preserving the boot
+    # snapshot held by gateway.code_skew. This turns gateway_state.json into an
+    # offline adoption check for Doctor without requiring an authenticated
+    # /health/detailed call.
+    payload["source"] = _runtime_source_status()
     payload["updated_at"] = _utc_now_iso()
 
     if gateway_state is not _UNSET:

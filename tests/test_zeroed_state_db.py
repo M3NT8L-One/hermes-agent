@@ -7,41 +7,41 @@ from pathlib import Path
 import pytest
 
 
-def test_is_zeroed_state_db_and_quarantine(tmp_path):
+def test_zeroed_quarantine_fails_closed_and_preserves_exact_cohort(tmp_path):
     import hermes_state as hs
 
     db = tmp_path / "state.db"
     db.write_bytes(bytes(1024))
+    Path(f"{db}-wal").write_bytes(b"wal-evidence")
+    Path(f"{db}-shm").write_bytes(b"shm-evidence")
+    Path(f"{db}-journal").write_bytes(b"journal-evidence")
     assert hs.is_zeroed_state_db(db) is True
 
     q = hs.quarantine_zeroed_state_db(db)
-    assert q is not None
-    assert q.exists()
-    assert not db.exists()
-    assert q.read_bytes() == bytes(1024)
+    assert q is None
+    assert db.read_bytes() == bytes(1024)
+    assert Path(f"{db}-wal").read_bytes() == b"wal-evidence"
+    assert Path(f"{db}-shm").read_bytes() == b"shm-evidence"
+    assert Path(f"{db}-journal").read_bytes() == b"journal-evidence"
 
 
-def test_sessiondb_opens_fresh_after_zeroed_quarantine(tmp_path, monkeypatch):
+def test_sessiondb_refuses_fresh_database_after_zeroed_detection(
+    tmp_path, monkeypatch
+):
     import hermes_state as hs
+    import sqlite3
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     db = tmp_path / "state.db"
     db.write_bytes(bytes(4096))
 
-    sdb = hs.SessionDB(db_path=db)
-    try:
-        # Fresh DB should open and accept schema
-        assert db.exists()
-        assert not hs.is_zeroed_state_db(db)
-        # Quarantine retained
-        backups = list(tmp_path.glob("state.db.zeroed-*.bak"))
-        assert len(backups) == 1
-        assert backups[0].stat().st_size == 4096
-    finally:
-        sdb.close()
+    with pytest.raises(sqlite3.DatabaseError, match="Preserved in place"):
+        hs.SessionDB(db_path=db)
+    assert db.read_bytes() == bytes(4096)
+    assert not list(tmp_path.glob("state.db.zeroed-*.bak"))
 
 
-def test_concurrent_quarantine_no_clobber(tmp_path):
+def test_concurrent_zeroed_opens_both_fail_closed_without_clobber(tmp_path):
     """#68805: two concurrent startups must not race on quarantine.
 
     Without the cross-process lock, the second process could move its
@@ -52,7 +52,6 @@ def test_concurrent_quarantine_no_clobber(tmp_path):
     """
     import hermes_state as hs
     import threading
-    import sqlite3
 
     db = tmp_path / "state.db"
     db.write_bytes(bytes(4096))  # zeroed (all-NUL) 4 KB file
@@ -62,10 +61,6 @@ def test_concurrent_quarantine_no_clobber(tmp_path):
 
     def worker(idx):
         try:
-            # Each worker opens its own SessionDB on the same path.
-            # The first one quarantines the zeroed file and creates a
-            # fresh DB. The second one should find a valid DB (or no
-            # file) under the lock and NOT clobber the quarantine.
             sdb = hs.SessionDB(db_path=db)
             try:
                 results[idx] = "ok"
@@ -81,26 +76,10 @@ def test_concurrent_quarantine_no_clobber(tmp_path):
     t1.join(timeout=10)
     t2.join(timeout=10)
 
-    # Both workers should complete without error
-    assert errors[0] is None, f"Worker 0 raised: {errors[0]}"
-    assert errors[1] is None, f"Worker 1 raised: {errors[1]}"
-
-    # The quarantine backup must survive — exactly one .bak file with
-    # the original 4096 zeroed bytes.
-    backups = list(tmp_path.glob("state.db.zeroed-*.bak"))
-    assert len(backups) >= 1, "At least one quarantine backup must exist"
-    for bak in backups:
-        assert bak.stat().st_size == 4096, (
-            f"Quarantine backup {bak} was clobbered: "
-            f"expected 4096 bytes, got {bak.stat().st_size}"
-        )
-
-    # The live state.db must be a valid (non-zeroed) SQLite database
-    assert db.exists()
-    assert not hs.is_zeroed_state_db(db)
-    conn = sqlite3.connect(str(db))
-    conn.execute("SELECT 1")
-    conn.close()
+    assert all(error is not None for error in errors)
+    assert results == [None, None]
+    assert db.read_bytes() == bytes(4096)
+    assert not list(tmp_path.glob("state.db.zeroed-*.bak"))
 
 
 def test_quarantine_fails_closed_when_lock_held(tmp_path):

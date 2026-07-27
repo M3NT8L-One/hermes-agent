@@ -7562,6 +7562,90 @@ def _get_systemd_service_for_pid(pid: int) -> str | None:
     return None
 
 
+def _get_launchd_service_for_pid(pid: int) -> str | None:
+    """Return the launchd service target that owns *pid* on macOS.
+
+    ``launchctl print pid/<pid>`` exposes the process's resource-coalition
+    name, which is the owning service label for a launchd-managed dashboard.
+    We then verify the label in the candidate domains before returning a
+    target suitable for ``launchctl kickstart -k``.
+    """
+    if sys.platform != "darwin":
+        return None
+    try:
+        result = subprocess.run(
+            ["launchctl", "print", f"pid/{int(pid)}"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+        )
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired, ValueError):
+        return None
+    if result.returncode != 0:
+        return None
+    output = result.stdout or ""
+    coalition = re.search(
+        r"resource coalition\s*=\s*\{.*?\n\s*name\s*=\s*([^\n]+)",
+        output,
+        re.DOTALL,
+    )
+    if not coalition:
+        return None
+    label = coalition.group(1).strip().strip("\"'")
+    if not label or any(char.isspace() for char in label):
+        return None
+
+    euid_match = re.search(r"\bcreator euid\s*=\s*(\d+)", output)
+    owner_uid = int(euid_match.group(1)) if euid_match else os.getuid()
+    domains = [f"gui/{owner_uid}", f"user/{owner_uid}"]
+    if owner_uid == 0:
+        domains.append("system")
+    for domain in domains:
+        target = f"{domain}/{label}"
+        try:
+            probe = subprocess.run(
+                ["launchctl", "print", target],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=10,
+            )
+        except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+            continue
+        # A manually-started dashboard inherits its parent application's
+        # coalition (Terminal, Codex, an IDE). That application's launchd
+        # label is valid too, but kickstarting it would restart the entire
+        # parent app. Require this dashboard PID to be the service's own main
+        # PID before treating the label as its supervisor.
+        owns_pid = re.search(
+            rf"^\s*pid\s*=\s*{int(pid)}\s*$",
+            probe.stdout or "",
+            re.MULTILINE,
+        )
+        if probe.returncode == 0 and owns_pid:
+            return target
+    return None
+
+
+def _try_restart_launchd_service(target: str) -> bool:
+    """Restart one launchd service as an atomic managed-process adoption."""
+    try:
+        result = subprocess.run(
+            ["launchctl", "kickstart", "-k", target],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=60,
+        )
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
+
+
 def _extract_scope_from_cgroup(cgroup_entry: str) -> str | None:
     """Extract the systemd scope (``user`` or ``system``) from a cgroup path.
 
@@ -7790,9 +7874,15 @@ def _kill_stale_dashboard_processes(
     # stay a stop, not a restart.
     pid_cgroup: dict[int, str | None] = {}
     pid_service: dict[int, str | None] = {}
+    pid_launchd: dict[int, str] = {}
     pid_cmdline: dict[int, list[str]] = {}
     if restart_managed and sys.platform != "win32":
         for pid in pids:
+            if sys.platform == "darwin":
+                launchd_target = _get_launchd_service_for_pid(pid)
+                if launchd_target:
+                    pid_launchd[pid] = launchd_target
+                    continue
             cg_path = _get_pid_cgroup_path(pid)
             pid_cgroup[pid] = cg_path
             pid_service[pid] = _get_systemd_service_for_pid(pid)
@@ -7805,6 +7895,8 @@ def _kill_stale_dashboard_processes(
 
     killed: list[int] = []
     failed: list[tuple[int, str]] = []
+    launchd_restarted_pids: set[int] = set()
+    launchd_failed_pids: set[int] = set()
 
     if sys.platform == "win32":
         for pid in pids:
@@ -7825,9 +7917,30 @@ def _kill_stale_dashboard_processes(
         import signal as _signal
         import time as _time
 
+        # A launchd-managed dashboard must be refreshed through launchd, not
+        # raw-killed and respawned as an unmanaged process. Group by service so
+        # a multi-process coalition is kickstarted once. This makes the macOS
+        # gateway + dashboard update a coordinated adoption cohort.
+        by_launchd_target: dict[str, list[int]] = {}
+        for pid, target in pid_launchd.items():
+            by_launchd_target.setdefault(target, []).append(pid)
+        for target, managed_pids in by_launchd_target.items():
+            if _try_restart_launchd_service(target):
+                launchd_restarted_pids.update(managed_pids)
+                killed.extend(managed_pids)
+                print(f"    ✓ restarted launchd service {target}")
+            else:
+                launchd_failed_pids.update(managed_pids)
+                failed.extend(
+                    (pid, f"launchctl kickstart failed for {target}")
+                    for pid in managed_pids
+                )
+                print(f"    ✗ failed to restart launchd service {target}")
+
         # SIGTERM first — give each process a chance to shut down cleanly
         # (uvicorn closes its socket, flushes logs, etc.).
-        for pid in pids:
+        raw_pids = [pid for pid in pids if pid not in pid_launchd]
+        for pid in raw_pids:
             try:
                 os.kill(pid, _signal.SIGTERM)
             except ProcessLookupError:
@@ -7839,7 +7952,9 @@ def _kill_stale_dashboard_processes(
         # Poll for exit up to ~3s total.
         deadline = _time.monotonic() + 3.0
         pending = [
-            p for p in pids if p not in killed and p not in {f[0] for f in failed}
+            p
+            for p in raw_pids
+            if p not in killed and p not in {f[0] for f in failed}
         ]
         while pending and _time.monotonic() < deadline:
             _time.sleep(0.1)
@@ -7876,12 +7991,14 @@ def _kill_stale_dashboard_processes(
     #  - manually-started PIDs: respawn the argv captured before the kill
     #    (#40449) — detached, headless, logged to logs/dashboard-restart.log.
     restarted_services: list[str] = []
-    unrecovered: list[int] = []
+    unrecovered: list[int] = list(launchd_failed_pids)
     if killed and restart_managed:
         failed_restarts: list[tuple[str, str]] = []
         seen_services: set[str] = set()
         respawn_cmds: list[list[str]] = []
         for pid in killed:
+            if pid in launchd_restarted_pids:
+                continue
             svc_name = pid_service.get(pid)
             if svc_name:
                 if svc_name in seen_services:
@@ -7937,10 +8054,9 @@ def _finish_dashboard_update_cleanup(node_failures: list[str]) -> None:
 
     print()
     print(
-        "⚠ A web dashboard/serve process was stopped during update and could "
-        "not be auto-restarted."
+        "⚠ A web dashboard/serve process could not be refreshed during update."
     )
-    print("  Re-launch it when you want the web UI back:")
+    print("  Restart or re-launch it when you want the web UI back:")
     print("    hermes dashboard --port <port>")
 
 
@@ -7986,7 +8102,7 @@ def _atomic_replace_dir(src: str, dst: str) -> None:
         shutil.rmtree(backup, ignore_errors=True)
 
 
-def _update_via_zip(args):
+def _update_via_zip(args, pre_update_snapshot_id=None):
     """Update Hermes Agent by downloading a ZIP archive.
 
     Used on Windows when git file I/O is broken (antivirus, NTFS filter
@@ -8184,60 +8300,55 @@ def _update_via_zip(args):
         logger.debug("Model catalog seed during zip update failed: %s", e)
 
     # ── Post-update state.db integrity guard (#68474) ─────────────────
-    # Same as the git-pull path: verify state.db survived the ZIP update
-    # and auto-restore from the most recent pre-update snapshot if needed.
+    # Live services can reopen state.db between a pathname check and replace.
+    # The shared guard therefore verifies/restores only while the managed
+    # gateway + dashboard/serve cohort is explicitly offline/unloaded.
     try:
-        from hermes_cli.backup import _quick_snapshot_root, verify_sqlite_integrity
+        from hermes_cli.backup import (
+            _quick_snapshot_root,
+            verify_or_restore_state_db_offline,
+        )
 
         _state_path = get_hermes_home() / "state.db"
-        if _state_path.exists():
-            _state_ok = verify_sqlite_integrity(
-                _state_path, check_header=True, run_pragma=True
+        _candidate = (
+            _quick_snapshot_root(get_hermes_home())
+            / pre_update_snapshot_id
+            / "state.db"
+            if pre_update_snapshot_id
+            else None
+        )
+        if _state_path.exists() or (
+            _candidate is not None and _candidate.exists()
+        ):
+            _state_result = verify_or_restore_state_db_offline(
+                _state_path,
+                _candidate,
+                reason=(
+                    "ZIP post-update recovery from exact pre-update snapshot "
+                    f"{pre_update_snapshot_id or '(none)'}"
+                ),
             )
-            if not _state_ok.get("valid"):
+            if _state_result.get("deferred"):
                 print()
                 print(
-                    "⚠ state.db is corrupted after update: "
-                    + _state_ok.get("message", "unknown error")
+                    "⚠ state.db post-update verification deferred: "
+                    + str(_state_result.get("reason"))
                 )
-                _snap_root = _quick_snapshot_root(get_hermes_home())
-                if _snap_root.exists():
-                    _snap_dirs = sorted(
-                        (d for d in _snap_root.iterdir() if d.is_dir()),
-                        reverse=True,
-                    )
-                    for _snap_dir in _snap_dirs:
-                        _snap_state = _snap_dir / "state.db"
-                        if _snap_state.exists():
-                            _snap_ok = verify_sqlite_integrity(
-                                _snap_state, check_header=True, run_pragma=True
-                            )
-                            if _snap_ok.get("valid"):
-                                try:
-                                    import shutil as _shutil
-
-                                    _shutil.copy2(_snap_state, _state_path)
-                                    _restored_ok = verify_sqlite_integrity(
-                                        _state_path,
-                                        check_header=True,
-                                        run_pragma=True,
-                                    )
-                                    if _restored_ok.get("valid"):
-                                        print(
-                                            "  ✓ Auto-restored from snapshot "
-                                            f"{_snap_dir.name}"
-                                        )
-                                    else:
-                                        print(
-                                            "  ✗ Auto-restore FAILED — restored "
-                                            "copy also failed integrity"
-                                        )
-                                    break
-                                except OSError as _exc:
-                                    print(
-                                        f"  ✗ Auto-restore file copy failed: {_exc}"
-                                    )
-                                    break
+                print(
+                    "  Stop/unload the Default gateway and dashboard/serve "
+                    "cohort, then run Doctor before any restore."
+                )
+            elif _state_result.get("applied"):
+                print(
+                    "  ✓ Restored state.db through validated offline "
+                    f"recovery (receipt: {_state_result.get('receipt_path')})"
+                )
+            elif not _state_result.get("healthy"):
+                print()
+                print(
+                    "✗ state.db post-update integrity guard failed: "
+                    + str(_state_result.get("reason"))
+                )
     except Exception as exc:
         logger.debug(
             "Post-update state.db integrity check (zip path) failed: %s", exc
@@ -12298,7 +12409,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
     if use_zip_update:
         # ZIP-based update for Windows when git is broken
         try:
-            _update_via_zip(args)
+            _update_via_zip(args, pre_update_snapshot_id)
         finally:
             _resume_windows_gateways_after_update(_windows_gateway_resume)
         return
@@ -12799,77 +12910,63 @@ def _cmd_update_impl(args, gateway_mode: bool):
         print("✓ Code updated!")
 
         # ── Post-update state.db integrity guard (#68474) ─────────────────
-        # Verify that state.db survived the update intact.  If the live file
-        # is now corrupted (zeroed, missing header, integrity failure),
-        # automatically restore from the pre-update snapshot rather than
-        # letting the user discover silently that their sessions are gone.
+        # Never open or replace the DB while the managed gateway/dashboard
+        # cohort can reopen it. The shared guard fails closed until that whole
+        # cohort is stopped and (on macOS) its launchd services are unloaded.
         try:
-            from hermes_cli.backup import _quick_snapshot_root, verify_sqlite_integrity
+            from hermes_cli.backup import (
+                _quick_snapshot_root,
+                verify_or_restore_state_db_offline,
+            )
 
             _state_path = get_hermes_home() / "state.db"
-            if _state_path.exists():
-                _state_ok = verify_sqlite_integrity(
+            _candidate = (
+                _quick_snapshot_root(get_hermes_home())
+                / pre_update_snapshot_id
+                / "state.db"
+                if pre_update_snapshot_id
+                else None
+            )
+            if _state_path.exists() or (
+                _candidate is not None and _candidate.exists()
+            ):
+                _state_result = verify_or_restore_state_db_offline(
                     _state_path,
-                    check_header=True,
-                    run_pragma=True,
+                    _candidate,
+                    reason=(
+                        "git post-update recovery from exact pre-update snapshot "
+                        f"{pre_update_snapshot_id or '(none)'}"
+                    ),
                 )
-                if _state_ok.get("valid"):
+                if _state_result.get("healthy") and not _state_result.get(
+                    "applied"
+                ):
                     logger.debug(
                         "Post-update state.db integrity check: %s",
-                        _state_ok.get("message"),
+                        _state_result.get("reason"),
+                    )
+                elif _state_result.get("deferred"):
+                    print()
+                    print(
+                        "⚠ state.db post-update verification deferred: "
+                        + str(_state_result.get("reason"))
+                    )
+                    print(
+                        "  Stop/unload the Default gateway and "
+                        "dashboard/serve cohort, then run Doctor before any "
+                        "restore."
+                    )
+                elif _state_result.get("applied"):
+                    print(
+                        "  ✓ Restored state.db through validated offline "
+                        f"recovery (receipt: {_state_result.get('receipt_path')})"
                     )
                 else:
                     print()
                     print(
-                        "⚠ state.db is corrupted after update: "
-                        + _state_ok.get("message", "unknown error")
+                        "✗ state.db post-update integrity guard failed: "
+                        + str(_state_result.get("reason"))
                     )
-                    _pre_snap_id = pre_update_snapshot_id
-                    if _pre_snap_id:
-                        _snap_state = (
-                            _quick_snapshot_root(get_hermes_home())
-                            / _pre_snap_id
-                            / "state.db"
-                        )
-                        if _snap_state.exists():
-                            _snap_ok = verify_sqlite_integrity(
-                                _snap_state, check_header=True, run_pragma=True
-                            )
-                            if _snap_ok.get("valid"):
-                                try:
-                                    import shutil as _shutil
-
-                                    _shutil.copy2(_snap_state, _state_path)
-                                    _restored_ok = verify_sqlite_integrity(
-                                        _state_path,
-                                        check_header=True,
-                                        run_pragma=True,
-                                    )
-                                    if _restored_ok.get("valid"):
-                                        print(
-                                            "  ✓ Auto-restored from pre-update "
-                                            f"snapshot ({_pre_snap_id})"
-                                        )
-                                    else:
-                                        print(
-                                            "  ✗ Auto-restore FAILED — restored "
-                                            "copy also failed integrity"
-                                        )
-                                except OSError as _exc:
-                                    print(
-                                        f"  ✗ Auto-restore file copy failed: {_exc}"
-                                    )
-                            else:
-                                print(
-                                    "  ✗ Pre-update snapshot also failed integrity"
-                                )
-                        else:
-                            print(
-                                "  ⚠ Pre-update snapshot does not contain state.db"
-                            )
-                    else:
-                        print("  ⚠ No pre-update snapshot was taken")
-                    print()
         except Exception as exc:
             logger.debug("Post-update state.db integrity check failed: %s", exc)
 
@@ -13979,7 +14076,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             print(f"⚠ Git update failed: {e}")
             print("→ Falling back to ZIP download...")
             print()
-            _update_via_zip(args)
+            _update_via_zip(args, pre_update_snapshot_id)
         else:
             print(f"✗ Update failed: {e}")
             sys.exit(1)
@@ -17106,6 +17203,16 @@ def main():
             if not db_path.exists():
                 print(f"No session database at {db_path} (nothing to repair).")
                 return
+            from hermes_cli.runtime_ownership import prove_state_db_quiescent
+
+            proof = prove_state_db_quiescent(db_path)
+            if not proof.quiescent:
+                print(
+                    "✗ Refusing to inspect or repair state.db until the "
+                    "gateway and dashboard/serve cohort is stopped/unloaded."
+                )
+                print(f"  {proof.reason}")
+                return
             reason = _db_opens_cleanly(db_path)
             if reason is None:
                 print(f"✓ {db_path} opens cleanly — no repair needed.")
@@ -17124,9 +17231,13 @@ def main():
                 try:
                     from hermes_state import SessionDB
 
-                    n = SessionDB()._conn.execute(
-                        "SELECT COUNT(*) FROM sessions"
-                    ).fetchone()[0]
+                    repaired_db = SessionDB()
+                    try:
+                        n = repaired_db._conn.execute(
+                            "SELECT COUNT(*) FROM sessions"
+                        ).fetchone()[0]
+                    finally:
+                        repaired_db.close()
                     print(f"✓ Repaired — {n} sessions recovered.")
                 except Exception:
                     print("✓ Repaired.")

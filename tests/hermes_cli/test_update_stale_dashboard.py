@@ -555,7 +555,7 @@ class TestDashboardUpdateCleanup:
             _finish_dashboard_update_cleanup([])
 
         out = capsys.readouterr().out
-        assert "stopped during update and could not be auto-restarted" in out
+        assert "could not be refreshed during update" in out
         assert "hermes dashboard --port <port>" in out
 
 
@@ -709,6 +709,138 @@ class TestSupervisedBackendRestart:
         respawn.assert_not_called()
         out = capsys.readouterr().out
         assert "Restart the dashboard when you're ready" in out
+
+
+class TestLaunchdManagedBackendRestart:
+    """macOS update adoption must preserve launchd ownership."""
+
+    def _live(self):
+        return sys.modules["hermes_cli.main"]
+
+    def test_launchd_service_target_is_resolved_from_process_coalition(
+        self, monkeypatch
+    ):
+        live = self._live()
+        monkeypatch.setattr(live.sys, "platform", "darwin")
+
+        def fake_run(args, *a, **kw):
+            if args == ["launchctl", "print", "pid/4321"]:
+                return MagicMock(
+                    returncode=0,
+                    stdout=(
+                        "pid/4321 = {\n"
+                        "\tcreator euid = 501\n"
+                        "\tresource coalition = {\n"
+                        "\t\tname = ai.hermes.dashboard.local\n"
+                        "\t}\n"
+                        "}\n"
+                    ),
+                    stderr="",
+                )
+            if args == [
+                "launchctl",
+                "print",
+                "gui/501/ai.hermes.dashboard.local",
+            ]:
+                return MagicMock(
+                    returncode=0,
+                    stdout="state = running\n\tpid = 4321\n",
+                    stderr="",
+                )
+            raise AssertionError(f"unexpected subprocess.run call: {args}")
+
+        with patch.object(live.subprocess, "run", side_effect=fake_run):
+            target = live._get_launchd_service_for_pid(4321)
+
+        assert target == "gui/501/ai.hermes.dashboard.local"
+
+    def test_inherited_application_coalition_is_not_treated_as_owner(
+        self, monkeypatch
+    ):
+        live = self._live()
+        monkeypatch.setattr(live.sys, "platform", "darwin")
+
+        def fake_run(args, *a, **kw):
+            if args == ["launchctl", "print", "pid/4321"]:
+                return MagicMock(
+                    returncode=0,
+                    stdout=(
+                        "pid/4321 = {\n"
+                        "\tcreator euid = 501\n"
+                        "\tresource coalition = {\n"
+                        "\t\tname = application.com.openai.codex.example\n"
+                        "\t}\n"
+                        "}\n"
+                    ),
+                    stderr="",
+                )
+            if args[:2] == ["launchctl", "print"]:
+                # The inherited app label is real, but its main PID is the app,
+                # not the manually-started dashboard child.
+                return MagicMock(
+                    returncode=0,
+                    stdout="state = running\n\tpid = 9999\n",
+                    stderr="",
+                )
+            raise AssertionError(f"unexpected subprocess.run call: {args}")
+
+        with patch.object(live.subprocess, "run", side_effect=fake_run):
+            target = live._get_launchd_service_for_pid(4321)
+
+        assert target is None
+
+    def test_update_kickstarts_launchd_owner_without_raw_kill(
+        self, monkeypatch, capsys
+    ):
+        live = self._live()
+        monkeypatch.setattr(live.sys, "platform", "darwin")
+
+        with patch.object(
+            live, "_restart_managed_dashboard_service", return_value=False
+        ), patch.object(
+            live, "_find_stale_dashboard_pids", return_value=[4321]
+        ), patch.object(
+            live,
+            "_get_launchd_service_for_pid",
+            return_value="gui/501/ai.hermes.dashboard.local",
+        ), patch.object(
+            live, "_try_restart_launchd_service", return_value=True
+        ) as restart, patch.object(
+            live.os, "kill"
+        ) as raw_kill:
+            result = _kill_stale_dashboard_processes(restart_managed=True)
+
+        restart.assert_called_once_with("gui/501/ai.hermes.dashboard.local")
+        raw_kill.assert_not_called()
+        assert result["killed"] == [4321]
+        assert result["unrecovered"] == []
+        assert "restarted launchd service" in capsys.readouterr().out
+
+    def test_failed_launchd_restart_is_not_raw_killed(
+        self, monkeypatch, capsys
+    ):
+        live = self._live()
+        monkeypatch.setattr(live.sys, "platform", "darwin")
+
+        with patch.object(
+            live, "_restart_managed_dashboard_service", return_value=False
+        ), patch.object(
+            live, "_find_stale_dashboard_pids", return_value=[4321]
+        ), patch.object(
+            live,
+            "_get_launchd_service_for_pid",
+            return_value="gui/501/ai.hermes.dashboard.local",
+        ), patch.object(
+            live, "_try_restart_launchd_service", return_value=False
+        ), patch.object(
+            live.os, "kill"
+        ) as raw_kill:
+            result = _kill_stale_dashboard_processes(restart_managed=True)
+
+        raw_kill.assert_not_called()
+        assert result["killed"] == []
+        assert result["unrecovered"] == [4321]
+        assert "failed to restart launchd service" in capsys.readouterr().out
 
 
 class TestManualBackendRespawn:

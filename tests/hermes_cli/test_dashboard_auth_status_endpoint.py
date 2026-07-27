@@ -72,6 +72,14 @@ def test_health_reports_liveness_without_loading_gateway_config(gated_client, mo
         raise AssertionError("health must not load gateway config")
 
     monkeypatch.setattr("gateway.config.load_gateway_config", _boom)
+    monkeypatch.setattr(
+        "gateway.code_skew.source_revision_status",
+        lambda: {
+            "boot_revision": "abc1234567",
+            "disk_revision": "abc1234567",
+            "code_skew": False,
+        },
+    )
 
     r = gated_client.get("/api/health")
     assert r.status_code == 200
@@ -80,6 +88,11 @@ def test_health_reports_liveness_without_loading_gateway_config(gated_client, mo
         "ok": True,
         "version": web_server.__version__,
         "auth_required": True,
+        "source": {
+            "boot_revision": "abc1234567",
+            "disk_revision": "abc1234567",
+            "code_skew": False,
+        },
     }
 
 

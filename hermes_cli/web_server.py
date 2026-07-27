@@ -3089,11 +3089,18 @@ async def get_ssh_ownership(request: Request):
 
 @app.get("/api/health")
 async def get_health():
-    """Lightweight process liveness for desktop/backend readiness probes."""
+    """Lightweight process liveness for desktop/backend readiness probes.
+
+    ``source`` makes long-lived dashboard adoption observable after an update.
+    It contains only compact Git revision labels (no paths or user data).
+    """
+    from gateway.code_skew import source_revision_status
+
     return {
         "ok": True,
         "version": __version__,
         "auth_required": bool(getattr(app.state, "auth_required", False)),
+        "source": source_revision_status(),
     }
 
 
@@ -20136,6 +20143,13 @@ def start_server(
     ``ssh_session_token`` and ``ssh_owner_nonce`` are process-local Desktop SSH
     bootstrap state. Neither is persisted or exported to child processes.
     """
+    # The dashboard/serve backend is a long-lived Python process just like the
+    # messaging gateway. Snapshot its checkout now so health/status and Doctor
+    # can distinguish an adopted update from stale in-memory modules.
+    from gateway.code_skew import record_boot_fingerprint
+
+    record_boot_fingerprint()
+
     _apply_ssh_session_token(ssh_session_token or "")
     _apply_ssh_owner_nonce(ssh_owner_nonce)
 
@@ -20321,6 +20335,21 @@ def start_server(
             app.state.bound_port = actual_port
 
             _write_dashboard_ready_file(actual_port)
+            from hermes_cli.runtime_ownership import write_runtime_identity
+
+            _runtime_identity_path = write_runtime_identity(
+                "serve" if headless else "dashboard",
+                home=get_process_hermes_home(),
+                details={
+                    "host": host,
+                    "port": actual_port,
+                    "headless": bool(headless),
+                },
+            )
+            if _runtime_identity_path is not None:
+                from hermes_cli.runtime_ownership import remove_runtime_identity
+
+                atexit.register(remove_runtime_identity, _runtime_identity_path)
             # Port-discovery sentinel parsed by the desktop spawn. `serve` is a
             # plain backend, not a dashboard, so it announces a neutral token;
             # `dashboard` keeps the legacy one. The desktop matches either.
@@ -20376,9 +20405,14 @@ def start_server(
                 _hb_interval, _loop_heartbeat, _hb_loop.time() + _hb_interval
             )
 
-            await server.main_loop()
-            if server.started:
-                await server.shutdown()
+            try:
+                await server.main_loop()
+                if server.started:
+                    await server.shutdown()
+            finally:
+                from hermes_cli.runtime_ownership import remove_runtime_identity
+
+                remove_runtime_identity(_runtime_identity_path)
 
     # On POSIX, keep the long-standing ``asyncio.run(_serve())`` behavior
     # unchanged — Python's default loop there is already a SelectorEventLoop

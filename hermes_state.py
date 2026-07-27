@@ -28,6 +28,7 @@ import threading
 import time
 from collections import deque
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 
 from agent.memory_manager import sanitize_context
@@ -1065,7 +1066,9 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
         conn.close()
 
 
-def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, Any]:
+def _repair_state_db_schema_candidate(
+    db_path: Path, *, backup: bool = False
+) -> Dict[str, Any]:
     """Repair a state.db whose ``sqlite_master`` schema is malformed or whose
     FTS indexes reject writes.
 
@@ -1230,6 +1233,107 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
             "(backup: %s); manual restore from backup may be required.",
             db_path, report["backup_path"],
         )
+    return report
+
+
+def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, Any]:
+    """Repair an offline clone, then rollback-safely replace the live cohort."""
+
+    from hermes_cli.backup import (
+        _sqlite_cohort_fingerprint,
+        replace_sqlite_db_offline,
+    )
+    from hermes_cli.runtime_ownership import prove_state_db_quiescent
+
+    db_path = Path(db_path).expanduser().resolve(strict=False)
+    report: Dict[str, Any] = {
+        "repaired": False,
+        "strategy": None,
+        "backup_path": None,
+        "error": None,
+    }
+    if not db_path.exists():
+        report["error"] = f"{db_path} does not exist"
+        return report
+
+    proof = prove_state_db_quiescent(db_path)
+    if not proof.quiescent:
+        report["error"] = (
+            "refusing state.db repair until the gateway and dashboard/serve "
+            f"cohort is stopped/unloaded: {proof.reason}"
+        )
+        return report
+
+    source_fingerprint = _sqlite_cohort_fingerprint(db_path)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    candidate_dir = (
+        db_path.parent
+        / "backups"
+        / "state-db-repair-candidates"
+        / f"{stamp}-{os.getpid()}"
+    )
+    candidate_dir.mkdir(parents=True, exist_ok=False)
+    candidate = candidate_dir / db_path.name
+    try:
+        import shutil
+
+        for suffix in ("", "-wal", "-shm", "-journal"):
+            source = Path(f"{db_path}{suffix}")
+            if source.exists():
+                shutil.copy2(source, Path(f"{candidate}{suffix}"))
+    except OSError as exc:
+        report["error"] = f"could not stage offline repair candidate: {exc}"
+        return report
+
+    proof = prove_state_db_quiescent(db_path)
+    if (
+        not proof.quiescent
+        or _sqlite_cohort_fingerprint(db_path) != source_fingerprint
+    ):
+        report["error"] = (
+            "state.db changed or became live while staging repair candidate; "
+            "no live mutation was attempted"
+        )
+        return report
+
+    candidate_report = _repair_state_db_schema_candidate(
+        candidate,
+        backup=False,
+    )
+    report["strategy"] = candidate_report.get("strategy")
+    if not candidate_report.get("repaired"):
+        report["error"] = candidate_report.get("error")
+        report["backup_path"] = str(candidate)
+        return report
+
+    if candidate_report.get("strategy") == "already_healthy":
+        report.update(
+            repaired=True,
+            backup_path=str(candidate_dir) if backup else None,
+        )
+        return report
+
+    replacement = replace_sqlite_db_offline(
+        candidate,
+        db_path,
+        reason=f"offline state.db repair ({report['strategy']})",
+    )
+    evidence_dir = replacement.get("evidence_dir")
+    preserved_original = (
+        Path(str(evidence_dir)) / f"original-{db_path.name}"
+        if evidence_dir
+        else None
+    )
+    report["backup_path"] = str(
+        preserved_original
+        if preserved_original is not None and preserved_original.exists()
+        else candidate
+    )
+    report["receipt_path"] = replacement.get("receipt_path")
+    if replacement.get("applied"):
+        report["repaired"] = True
+    else:
+        report["error"] = replacement.get("reason")
     return report
 
 
@@ -1841,117 +1945,30 @@ def is_zeroed_state_db(
 
 
 def quarantine_zeroed_state_db(path: Path) -> Optional[Path]:
-    """Move a zeroed state.db aside (preserve bytes) and return quarantine path.
+    """Fail closed for a zeroed live database.
 
-    Uses a cross-process lock (``#68805``) so two concurrent startups cannot
-    race: the first process moves the zeroed file and the second re-checks
-    under the lock, finding the file already gone (or a fresh DB in its place)
-    instead of clobbering the quarantine.
+    A prior implementation renamed the main file and sidecars one at a time,
+    then immediately created a fresh database. A crash or process reopen
+    between those renames can create a split generation. Zeroed bytes are now
+    left untouched for explicit offline recovery through the receipt-backed
+    restore path.
     """
-    import platform
 
-    lock_path = path.with_name(path.name + ".quarantine.lock")
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    handle = lock_path.open("a+b")
-    acquired = False
-    try:
-        deadline = time.monotonic() + 5.0
-        if platform.system() == "Windows":
-            import msvcrt
-            while True:
-                try:
-                    handle.seek(0)
-                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-                    acquired = True
-                    break
-                except OSError:
-                    if time.monotonic() >= deadline:
-                        break
-                    time.sleep(0.020)
-        else:
-            import fcntl
-            while True:
-                try:
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    acquired = True
-                    break
-                except (BlockingIOError, OSError):
-                    if time.monotonic() >= deadline:
-                        break
-                    time.sleep(0.020)
-        if not acquired:
-            # Fail closed: do NOT proceed without the lock. A slow or paused
-            # startup that still owns the lock can overlap this fallback and
-            # the two processes can act on the same live file (#68805 review).
-            logger.error(
-                "quarantine lock for %s not acquired within 5s — refusing to "
-                "quarantine without the cross-process lock. The zeroed file "
-                "is left in place. If sessions fail to load, restore from "
-                "state-snapshots via `hermes snapshot list` / "
-                "`hermes snapshot restore <id>`.",
-                path,
-            )
-            return None
-        # Re-check under the lock: another process may have already quarantined
-        # the file, leaving a fresh DB (or no file at all) in its place.
-        if not path.exists():
-            logger.info(
-                "quarantine_zeroed_state_db: %s already moved by another process",
-                path,
-            )
-            return None
-        if not is_zeroed_state_db(path):
-            logger.info(
-                "quarantine_zeroed_state_db: %s is no longer zeroed (another "
-                "process quarantined it and a fresh DB was created)",
-                path,
-            )
-            return None
+    path = Path(path)
+    if not path.exists() or not is_zeroed_state_db(path):
+        return None
+    from hermes_cli.runtime_ownership import prove_state_db_quiescent
 
-        try:
-            ts = time.strftime("%Y%m%d-%H%M%S")
-        except Exception:
-            ts = "unknown"
-        # Unique destination with PID suffix to avoid collision across
-        # concurrent startups that somehow both enter the lock.
-        dest = path.with_name(
-            f"{path.name}.zeroed-{ts}-{os.getpid()}.bak"
-        )
-        # Non-clobbering: if dest somehow exists, append a counter.
-        n = 0
-        while dest.exists():
-            n += 1
-            dest = path.with_name(
-                f"{path.name}.zeroed-{ts}-{os.getpid()}-{n}.bak"
-            )
-        try:
-            path.rename(dest)
-        except OSError as exc:
-            logger.error("Failed to quarantine zeroed %s: %s", path, exc)
-            return None
-        # Also move empty WAL/SHM if present so a fresh open is clean
-        for suffix in ("-wal", "-shm"):
-            side = Path(str(path) + suffix)
-            if side.exists():
-                try:
-                    side.rename(Path(str(dest) + suffix))
-                except OSError:
-                    pass
-        return dest
-    finally:
-        try:
-            if acquired:
-                if platform.system() == "Windows":
-                    import msvcrt
-                    handle.seek(0)
-                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-                else:
-                    import fcntl
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-        except (OSError, AttributeError):
-            pass
-        finally:
-            handle.close()
+    proof = prove_state_db_quiescent(path)
+    logger.error(
+        "Automatic zeroed state.db quarantine is disabled; preserved %s in "
+        "place. Ownership state: %s. Stop/unload the gateway and "
+        "dashboard/serve cohort, preserve evidence, and restore a validated "
+        "snapshot explicitly.",
+        path,
+        proof.reason,
+    )
+    return None
 
 
 class SessionDB:
@@ -2080,9 +2097,9 @@ class SessionDB:
                 preflight_db_writability(self.db_path, db_label="state.db")
 
             # #68474: zeroed state.db (size>0, all-NUL header) used to fail as a
-            # generic "file is not a database" with no recovery path. Quarantine
-            # the bytes (do not delete) and continue so a fresh DB can open;
-            # point the operator at pre-update snapshots.
+            # generic "file is not a database" or get partially quarantined
+            # before an empty replacement opened. Preserve the exact cohort in
+            # place and fail closed with the explicit offline recovery path.
             if (
                 not read_only
                 and self.db_path.exists()
@@ -2092,21 +2109,20 @@ class SessionDB:
                     zsize = self.db_path.stat().st_size
                 except OSError:
                     zsize = -1
-                qpath = quarantine_zeroed_state_db(self.db_path)
+                quarantine_zeroed_state_db(self.db_path)
                 snaps = self.db_path.parent / "state-snapshots"
                 msg = (
                     f"state.db looks ZEROED ({zsize} bytes, no SQLite header). "
-                    f"Preserved at {qpath or '(quarantine failed — file left in place)'}. "
+                    "Preserved in place; automatic quarantine and empty-DB "
+                    "recreation are refused because a partial cohort rename "
+                    "can split live SQLite generations. "
                     f"Restore from {snaps} via `hermes snapshot list` / "
-                    f"`hermes snapshot restore <id>` if available. "
-                    "Opening a fresh empty database so the agent can start."
+                    "`hermes snapshot restore <id>` only after the gateway "
+                    "and dashboard/serve cohort is stopped/unloaded."
                 )
                 logger.error(msg)
                 _set_last_init_error(msg)
-                # If quarantine failed, do not open the zeroed file (would fail
-                # opaquely or risk further damage). Raise with the clear message.
-                if qpath is None and self.db_path.exists() and is_zeroed_state_db(self.db_path):
-                    raise sqlite3.DatabaseError(msg)
+                raise sqlite3.DatabaseError(msg)
 
             def _connect_and_init():
                 self._conn = _connect_tracked_db(

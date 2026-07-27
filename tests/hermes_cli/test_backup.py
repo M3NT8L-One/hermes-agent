@@ -6,6 +6,7 @@ import sqlite3
 import zipfile
 from argparse import Namespace
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -68,6 +69,36 @@ def _make_hermes_tree(root: Path) -> None:
     # Logs (should be included)
     (root / "logs").mkdir(exist_ok=True)
     (root / "logs" / "agent.log").write_text("log line\n")
+
+
+def _make_canonical_state_db(path: Path) -> None:
+    """Create the minimum canonical session schema used by safety probes."""
+
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute(
+            "CREATE TABLE sessions ("
+            "id TEXT PRIMARY KEY, source TEXT NOT NULL, "
+            "started_at REAL NOT NULL, data TEXT)"
+        )
+        conn.execute(
+            "CREATE TABLE messages ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, "
+            "role TEXT NOT NULL, content TEXT, timestamp REAL NOT NULL)"
+        )
+        conn.execute(
+            "INSERT INTO sessions(id, source, started_at, data) "
+            "VALUES ('s1', 'cli', 1.0, 'hello world')"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _canonical_state_bytes(tmp_path: Path, name: str) -> bytes:
+    path = tmp_path / name
+    _make_canonical_state_db(path)
+    return path.read_bytes()
 
 
 def _symlink_file_or_skip(link: Path, target: Path) -> None:
@@ -270,7 +301,15 @@ class TestBackup:
                 return FailingBackupConnection(connection)
             return connection
 
-        monkeypatch.setattr(backup_mod.sqlite3, "connect", connect_with_failed_backup)
+        monkeypatch.setattr(
+            backup_mod.subprocess,
+            "run",
+            lambda *_args, **_kwargs: SimpleNamespace(
+                returncode=1,
+                stdout="",
+                stderr="forced backup failure",
+            ),
+        )
         out_zip = tmp_path / "backup.zip"
         try:
             backup_mod.run_backup(Namespace(output=str(out_zip)))
@@ -856,7 +895,9 @@ class TestImport:
             "config.yaml": "model: openrouter\n",
             ".env": "OPENROUTER_API_KEY=sk-secret\n",
             "auth.json": '{"providers": {"nous": "token"}}',
-            "state.db": b"SQLite format 3\x00",
+            "state.db": _canonical_state_bytes(
+                tmp_path, "secret-import-state.db"
+            ),
             "profiles/coder/.env": "ANTHROPIC_API_KEY=sk-ant-secret\n",
         })
 
@@ -1430,6 +1471,33 @@ class TestSafeCopyDb:
         conn.close()
         assert rows == [("wal-test",)]
 
+    def test_tracked_parent_connection_remains_registered_during_copy(
+        self, tmp_path
+    ):
+        from hermes_cli.backup import _safe_copy_db
+        from hermes_cli.sqlite_safe_read import (
+            connect_tracked,
+            has_live_connection,
+        )
+
+        src = tmp_path / "tracked.db"
+        dst = tmp_path / "copy.db"
+        live = connect_tracked(src, isolation_level=None)
+        try:
+            live.execute("CREATE TABLE t (x INTEGER)")
+            live.execute("INSERT INTO t VALUES (7)")
+            assert has_live_connection(src) is True
+            assert _safe_copy_db(src, dst) is True
+            # The parent never opened/closed a second source descriptor; its
+            # registered long-lived connection and locks remain intact.
+            assert has_live_connection(src) is True
+            assert live.execute("SELECT x FROM t").fetchone() == (7,)
+        finally:
+            live.close()
+
+        with sqlite3.connect(dst) as copied:
+            assert copied.execute("SELECT x FROM t").fetchone() == (7,)
+
 
 
     def test_is_zeroed_sqlite_file_detects_nul_header(self, tmp_path):
@@ -1475,11 +1543,7 @@ class TestQuickSnapshot:
 
         # Real SQLite database
         db_path = home / "state.db"
-        conn = sqlite3.connect(str(db_path))
-        conn.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, data TEXT)")
-        conn.execute("INSERT INTO sessions VALUES ('s1', 'hello world')")
-        conn.commit()
-        conn.close()
+        _make_canonical_state_db(db_path)
         return home
 
     def test_creates_snapshot(self, hermes_home):
@@ -1495,13 +1559,28 @@ class TestQuickSnapshot:
         snap_id = create_quick_snapshot(label="before-upgrade", hermes_home=hermes_home)
         assert "before-upgrade" in snap_id
 
+    def test_same_second_same_label_never_clobbers_first(self, hermes_home):
+        from hermes_cli.backup import create_quick_snapshot
+
+        first = create_quick_snapshot(label="collision", hermes_home=hermes_home)
+        first_manifest = (
+            hermes_home / "state-snapshots" / first / "manifest.json"
+        ).read_bytes()
+        second = create_quick_snapshot(label="collision", hermes_home=hermes_home)
+
+        assert second != first
+        assert (
+            hermes_home / "state-snapshots" / first / "manifest.json"
+        ).read_bytes() == first_manifest
+        assert (hermes_home / "state-snapshots" / second).is_dir()
+
     def test_state_db_safely_copied(self, hermes_home):
         from hermes_cli.backup import create_quick_snapshot
         snap_id = create_quick_snapshot(hermes_home=hermes_home)
         db_copy = hermes_home / "state-snapshots" / snap_id / "state.db"
         assert db_copy.exists()
         conn = sqlite3.connect(str(db_copy))
-        rows = conn.execute("SELECT * FROM sessions").fetchall()
+        rows = conn.execute("SELECT id, data FROM sessions").fetchall()
         conn.close()
         assert len(rows) == 1
         assert rows[0] == ("s1", "hello world")
@@ -1639,14 +1718,17 @@ class TestQuickSnapshot:
         snap_id = create_quick_snapshot(hermes_home=hermes_home)
 
         conn = sqlite3.connect(str(hermes_home / "state.db"))
-        conn.execute("INSERT INTO sessions VALUES ('s2', 'new')")
+        conn.execute(
+            "INSERT INTO sessions(id, source, started_at, data) "
+            "VALUES ('s2', 'cli', 2.0, 'new')"
+        )
         conn.commit()
         conn.close()
 
         restore_quick_snapshot(snap_id, hermes_home=hermes_home)
 
         conn = sqlite3.connect(str(hermes_home / "state.db"))
-        rows = conn.execute("SELECT * FROM sessions").fetchall()
+        rows = conn.execute("SELECT id, data FROM sessions").fetchall()
         conn.close()
         assert len(rows) == 1
 
@@ -1654,12 +1736,21 @@ class TestQuickSnapshot:
         from hermes_cli.backup import restore_quick_snapshot
         assert restore_quick_snapshot("nonexistent", hermes_home=hermes_home) is False
 
-    def test_auto_prune(self, hermes_home):
+    def test_creation_is_append_only(self, hermes_home):
         from hermes_cli.backup import create_quick_snapshot, list_quick_snapshots, _QUICK_DEFAULT_KEEP
         for i in range(_QUICK_DEFAULT_KEEP + 5):
             create_quick_snapshot(label=f"snap-{i:03d}", hermes_home=hermes_home)
         snaps = list_quick_snapshots(limit=100, hermes_home=hermes_home)
-        assert len(snaps) <= _QUICK_DEFAULT_KEEP
+        assert len(snaps) == _QUICK_DEFAULT_KEEP + 5
+        assert all(
+            (
+                hermes_home
+                / "state-snapshots"
+                / snap["id"]
+                / "verification-receipt.json"
+            ).exists()
+            for snap in snaps
+        )
 
     def test_manual_prune(self, hermes_home):
         from hermes_cli.backup import create_quick_snapshot, prune_quick_snapshots, list_quick_snapshots
@@ -2112,7 +2203,15 @@ class TestPreUpdateBackup:
                 return FailingBackupConnection(connection)
             return connection
 
-        monkeypatch.setattr(backup_mod.sqlite3, "connect", connect_with_failed_backup)
+        monkeypatch.setattr(
+            backup_mod.subprocess,
+            "run",
+            lambda *_args, **_kwargs: SimpleNamespace(
+                returncode=1,
+                stdout="",
+                stderr="forced backup failure",
+            ),
+        )
         out_zip = tmp_path / "pre-update.zip"
         try:
             result = backup_mod._write_full_zip_backup(out_zip, hermes_home)
@@ -2169,6 +2268,8 @@ class TestPreUpdateBackup:
         # Second backup — must not include the first
         out2 = create_pre_update_backup(hermes_home=hermes_home)
         assert out2 is not None
+        assert out2 != out1
+        assert out1.exists()
         with zipfile.ZipFile(out2) as zf:
             names = zf.namelist()
         assert not any(n.startswith("backups/") for n in names), (
@@ -2176,9 +2277,8 @@ class TestPreUpdateBackup:
             f"{[n for n in names if n.startswith('backups/')]}"
         )
 
-    def test_rotation_keeps_only_n(self, hermes_home):
-        """After more than ``keep`` backups are created, older ones are
-        pruned automatically."""
+    def test_creation_never_rotates_prior_backups(self, hermes_home):
+        """Creation is append-only; retention is a separate explicit action."""
         import time as _t
         from hermes_cli.backup import create_pre_update_backup
 
@@ -2192,12 +2292,12 @@ class TestPreUpdateBackup:
             p.name for p in (hermes_home / "backups").iterdir()
             if p.name.startswith("pre-update-")
         )
-        assert len(remaining) == 3
-        # Oldest two should have been pruned
-        assert created[0].name not in remaining
-        assert created[1].name not in remaining
-        # Newest three should remain
-        assert created[4].name in remaining
+        assert all(path.name in remaining for path in created)
+        assert len(list((hermes_home / "backups").glob("pre-update-*.zip"))) == 5
+        assert all(
+            path.with_suffix(path.suffix + ".receipt.json").exists()
+            for path in created
+        )
 
     def test_rotation_preserves_manual_files(self, hermes_home):
         """Hand-dropped zips in ``backups/`` must not be touched by
@@ -2242,11 +2342,8 @@ class TestPreUpdateBackup:
         assert out is not None
         assert out.exists()
 
-    def test_keep_zero_still_prunes_older_backups(self, hermes_home):
-        """The floor preserves the new backup but should NOT regress the
-        rotation behaviour for older zips: a third call with keep=0 must
-        still remove pre-existing backups beyond the (floored) limit of 1.
-        """
+    def test_keep_zero_is_append_only(self, hermes_home):
+        """Even keep=0 cannot delete prior state-bearing artifacts."""
         import time as _t
         from hermes_cli.backup import create_pre_update_backup
 
@@ -2258,13 +2355,9 @@ class TestPreUpdateBackup:
 
         remaining = {
             p.name for p in (hermes_home / "backups").iterdir()
-            if p.name.startswith("pre-update-")
+            if p.name.startswith("pre-update-") and p.suffix == ".zip"
         }
-        assert third.name in remaining, "Floor must preserve the new backup"
-        assert first.name not in remaining and second.name not in remaining, (
-            f"keep=0 floor of 1 should still prune older backups; "
-            f"remaining={remaining}"
-        )
+        assert {first.name, second.name, third.name} <= remaining
 
     def test_skips_symlinked_files(self, hermes_home, tmp_path):
         """Pre-update backups must not dereference symlinks outside HERMES_HOME."""
@@ -2506,7 +2599,7 @@ class TestPreMigrationBackup:
             names = zf.namelist()
         assert not any(n.startswith("backups/") for n in names)
 
-    def test_rotation_keeps_only_n(self, hermes_home):
+    def test_creation_never_rotates_prior_backups(self, hermes_home):
         import time as _t
         from hermes_cli.backup import create_pre_migration_backup
 
@@ -2518,7 +2611,8 @@ class TestPreMigrationBackup:
             _t.sleep(1.05)  # timestamp resolution
 
         remaining = sorted((hermes_home / "backups").glob("pre-migration-*.zip"))
-        assert len(remaining) <= 3, f"expected <=3 backups retained, got {len(remaining)}"
+        assert len(remaining) == 7
+        assert all(path in remaining for path in created)
 
     def test_missing_hermes_home_returns_none(self, tmp_path):
         """Fresh install with no ~/.hermes yet — nothing to back up."""
@@ -2770,10 +2864,13 @@ class TestMemoryProviderExternalPaths:
         hermes_home.mkdir()
 
         zip_path = tmp_path / "backup.zip"
+        state_bytes = _canonical_state_bytes(
+            tmp_path, "external-import-state.db"
+        )
         with zipfile.ZipFile(zip_path, "w") as zf:
             zf.writestr("config.yaml", "model: {}\n")
             zf.writestr(".env", "X=1\n")
-            zf.writestr("state.db", "")
+            zf.writestr("state.db", state_bytes)
             zf.writestr("_external/.honcho/config.json", '{"peer":"bob"}')
 
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
@@ -2799,10 +2896,13 @@ class TestMemoryProviderExternalPaths:
         sentinel = tmp_path / "PWNED"
 
         zip_path = tmp_path / "backup.zip"
+        state_bytes = _canonical_state_bytes(
+            tmp_path, "traversal-import-state.db"
+        )
         with zipfile.ZipFile(zip_path, "w") as zf:
             zf.writestr("config.yaml", "model: {}\n")
             zf.writestr(".env", "X=1\n")
-            zf.writestr("state.db", "")
+            zf.writestr("state.db", state_bytes)
             zf.writestr("_external/../../PWNED", "pwned")
 
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
