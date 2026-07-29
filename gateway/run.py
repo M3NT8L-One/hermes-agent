@@ -18451,7 +18451,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "session %s via self-post",
                             raw_sid,
                         )
-                        await deliver_wake(adapter, text=synth_text, session_id=raw_sid)
+                        delivery_key = self._completion_delivery_key(evt)
+                        wake_kwargs = (
+                            {"delivery_key": delivery_key} if delivery_key else {}
+                        )
+                        await deliver_wake(
+                            adapter,
+                            text=synth_text,
+                            session_id=raw_sid,
+                            **wake_kwargs,
+                        )
                         return True
                     except Exception as e:
                         logger.warning(
@@ -18494,7 +18503,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "%s via self-post",
                     raw_sid,
                 )
-                await deliver_wake(adapter, text=synth_text, session_id=raw_sid)
+                delivery_key = self._completion_delivery_key(evt)
+                wake_kwargs = {"delivery_key": delivery_key} if delivery_key else {}
+                await deliver_wake(
+                    adapter,
+                    text=synth_text,
+                    session_id=raw_sid,
+                    **wake_kwargs,
+                )
                 return True
             except Exception as e:
                 logger.warning(
@@ -18548,6 +18564,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if producer_id and started_at is not None:
                 return (evt_type, producer_id, started_at)
         return None
+
+    @classmethod
+    def _completion_delivery_key(cls, evt: dict) -> str:
+        """Return the stable API idempotency key for one producer completion."""
+        identity = cls._completion_delivery_identity(evt)
+        if identity is None:
+            return ""
+        kind, producer_id, incarnation = identity
+        parts = ["hermes-wake-v1", kind, producer_id]
+        if incarnation != "":
+            parts.append(str(incarnation))
+        return ":".join(parts)
 
     async def _classify_completion_target(self, parent_session_id: str) -> str:
         """Classify an async-completion delivery target before adapter acceptance.

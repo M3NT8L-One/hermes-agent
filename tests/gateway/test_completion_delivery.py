@@ -363,6 +363,52 @@ def test_distinct_process_incarnations_are_not_deduplicated():
     assert adapter.handle_message.await_count == 2
 
 
+@pytest.mark.parametrize(
+    ("event", "expected_key"),
+    [
+        (
+            {
+                **_async_event("deleg_wake_key"),
+                "session_key": "raw-api-session",
+                "origin_session_id": "raw-api-session",
+            },
+            "hermes-wake-v1:async_delegation:deleg_wake_key",
+        ),
+        (
+            {
+                **_completion_event(started_at=1722211000.0, session_id="proc_wake_key"),
+                "session_key": "raw-api-session",
+                "origin_session_id": "raw-api-session",
+                "platform": "",
+                "chat_type": "",
+                "chat_id": "",
+            },
+            "hermes-wake-v1:completion:proc_wake_key:1722211000.0",
+        ),
+    ],
+)
+def test_api_completion_wake_uses_producer_stable_delivery_key(
+    monkeypatch, event, expected_key,
+):
+    """Wake retries key off producer identity, never assistant text."""
+    adapter = SimpleNamespace(supports_async_delivery=False)
+    runner = _runner(adapter)
+    runner.adapters = {Platform.API_SERVER: adapter}  # type: ignore[assignment]
+    wake = AsyncMock()
+    monkeypatch.setattr("gateway.wake.deliver_wake", wake)
+
+    assert asyncio.run(
+        runner._deliver_completion_notification("same text is irrelevant", event)
+    ) is True
+
+    wake.assert_awaited_once_with(
+        adapter,
+        text="same text is irrelevant",
+        session_id="raw-api-session",
+        delivery_key=expected_key,
+    )
+
+
 def test_delivered_identity_retention_is_bounded():
     """Lifecycle dedupe cannot grow without bound in a long-running gateway."""
     adapter = SimpleNamespace(handle_message=AsyncMock())

@@ -106,6 +106,7 @@ def test_deliver_wake_non_push_self_posts_raw_session_id(monkeypatch):
     async def handler(request):
         seen["session_id"] = request.headers.get("X-Hermes-Session-Id")
         seen["auth"] = request.headers.get("Authorization")
+        seen["idempotency_key"] = request.headers.get("Idempotency-Key")
         seen["body"] = await request.json()
         return web.json_response({"choices": [{"message": {"content": "ok"}}]})
 
@@ -113,13 +114,19 @@ def test_deliver_wake_non_push_self_posts_raw_session_id(monkeypatch):
         runner, port = await _serve(handler)
         try:
             adapter = ApiServerLikeAdapter(host="0.0.0.0", port=port, key="sekrit")
-            await deliver_wake(adapter, text="task done — wake", session_id="raw-sid-42")
+            await deliver_wake(
+                adapter,
+                text="task done — wake",
+                session_id="raw-sid-42",
+                delivery_key="async-delegation:deleg_123",
+            )
         finally:
             await runner.cleanup()
 
     asyncio.run(run())
     assert seen["session_id"] == "raw-sid-42"
     assert seen["auth"] == "Bearer sekrit"
+    assert seen["idempotency_key"] == "async-delegation:deleg_123"
     assert seen["body"]["stream"] is False
     assert seen["body"]["messages"] == [
         {"role": "user", "content": "task done — wake"}
@@ -134,9 +141,11 @@ def test_deliver_wake_retries_429_then_succeeds(monkeypatch):
 
     monkeypatch.setattr(wake_mod, "_RETRY_DELAYS_SECONDS", (0.01, 0.01, 0.01))
     calls = {"n": 0}
+    seen_keys = []
 
     async def handler(request):
         calls["n"] += 1
+        seen_keys.append(request.headers.get("Idempotency-Key"))
         if calls["n"] == 1:
             return web.json_response({"error": "busy"}, status=429)
         return web.json_response({"choices": []})
@@ -145,12 +154,21 @@ def test_deliver_wake_retries_429_then_succeeds(monkeypatch):
         runner, port = await _serve(handler)
         try:
             adapter = ApiServerLikeAdapter(port=port)
-            await deliver_wake(adapter, text="x", session_id="sid")
+            await deliver_wake(
+                adapter,
+                text="x",
+                session_id="sid",
+                delivery_key="process:proc_7:1722211000.0",
+            )
         finally:
             await runner.cleanup()
 
     asyncio.run(run())
     assert calls["n"] == 2
+    assert seen_keys == [
+        "process:proc_7:1722211000.0",
+        "process:proc_7:1722211000.0",
+    ]
 
 
 def test_deliver_wake_raises_on_permanent_http_error(monkeypatch):

@@ -36,9 +36,8 @@ logger = logging.getLogger(__name__)
 WAKE_TURN_TIMEOUT_SECONDS = 600.0
 
 # Backoff delays between retries on transient failures (429 concurrency cap,
-# connection errors). The API server has no per-session lock — concurrent
-# turns on one session are last-writer-wins — but it DOES enforce a global
-# max_concurrent_runs cap via HTTP 429, which is worth waiting out.
+# connection errors). The API server serializes tool-capable turns per session
+# and also enforces a global max_concurrent_runs cap via HTTP 429.
 _RETRY_DELAYS_SECONDS = (2.0, 5.0, 10.0)
 
 
@@ -58,6 +57,7 @@ async def deliver_wake(
     *,
     text: str,
     session_id: str = "",
+    delivery_key: str = "",
     source: Any = None,
 ) -> None:
     """Deliver a wake turn to the session behind ``adapter``.
@@ -91,11 +91,16 @@ async def deliver_wake(
             "deliver_wake: non-push adapter (supports_async_delivery=False) "
             "requires the raw session id to self-post the wake turn"
         )
-    await _self_post_chat_completion(adapter, text=text, session_id=session_id)
+    await _self_post_chat_completion(
+        adapter,
+        text=text,
+        session_id=session_id,
+        delivery_key=delivery_key,
+    )
 
 
 async def _self_post_chat_completion(
-    adapter: Any, *, text: str, session_id: str
+    adapter: Any, *, text: str, session_id: str, delivery_key: str = ""
 ) -> None:
     """POST the wake text to the in-pod API server as a normal session turn.
 
@@ -127,6 +132,8 @@ async def _self_post_chat_completion(
         "Authorization": f"Bearer {api_key}",
         "X-Hermes-Session-Id": session_id,
     }
+    if delivery_key:
+        headers["Idempotency-Key"] = delivery_key
     payload = {
         "model": str(getattr(adapter, "_model_name", "") or "hermes-agent"),
         "messages": [{"role": "user", "content": text}],

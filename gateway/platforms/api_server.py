@@ -965,7 +965,7 @@ def _openai_error(message: str, err_type: str = "invalid_request_error", param: 
     }
 
 
-_api_agent_request_reservation: ContextVar[Optional[dict[str, bool]]] = ContextVar(
+_api_agent_request_reservation: ContextVar[Optional[dict[str, Any]]] = ContextVar(
     "api_agent_request_reservation", default=None
 )
 
@@ -988,18 +988,44 @@ def _admit_api_agent_request(handler):
         draining = self._draining_response()
         if draining is not None:
             return draining
-        reservation = {"active": True}
+        reservation: dict[str, Any] = {
+            "active": True,
+            "session_admission_active": False,
+            "session_admission_detached": False,
+        }
         token = _api_agent_request_reservation.set(reservation)
         self._pending_agent_requests += 1
         try:
+            session_id = await self._api_agent_request_session_id(request)
+            if session_id:
+                entry = await self._acquire_session_agent_admission(session_id)
+                reservation.update(
+                    {
+                        "session_admission_active": True,
+                        "session_admission_id": session_id,
+                        "session_admission_entry": entry,
+                    }
+                )
             return await handler(self, request, *args, **kwargs)
         finally:
+            if not reservation["session_admission_detached"]:
+                self._release_session_agent_admission(reservation)
             if reservation["active"]:
                 reservation["active"] = False
                 self._pending_agent_requests = max(0, self._pending_agent_requests - 1)
             _api_agent_request_reservation.reset(token)
 
     return _wrapped
+
+
+async def _cancel_and_wait_task_terminal(task: "asyncio.Task[Any]") -> None:
+    """Cancel a child agent task and wait until its cleanup is terminal."""
+    if not task.done():
+        task.cancel()
+    try:
+        await task
+    except (asyncio.CancelledError, Exception):
+        pass
 
 
 def _release_pending_api_work(adapter, reservation: dict[str, bool]) -> None:
@@ -1322,6 +1348,10 @@ class APIServerAdapter(BasePlatformAdapter):
         # Shutdown counts this reservation so the request cannot slip through
         # the drain between its first await and _run_agent()/task registration.
         self._pending_agent_requests: int = 0
+        # One tool-capable API turn may mutate a given Hermes session at a time.
+        # Entries are reference-counted so idle locks are removed without racing
+        # queued waiters and the registry cannot grow with historical sessions.
+        self._session_agent_admissions: Dict[str, Dict[str, Any]] = {}
 
     def active_agent_work_count(self) -> int:
         """Return all live agent work owned by this API adapter.
@@ -1368,6 +1398,111 @@ class APIServerAdapter(BasePlatformAdapter):
             ),
             status=503,
             headers={"Retry-After": "1"},
+        )
+
+    async def _api_agent_request_session_id(self, request: Any) -> str:
+        """Resolve the transcript identity before a mutating handler can run."""
+        match_info = getattr(request, "match_info", {}) or {}
+        session_id = str(match_info.get("session_id") or "").strip()
+        if session_id:
+            return session_id
+
+        headers = getattr(request, "headers", {}) or {}
+        session_id = str(headers.get("X-Hermes-Session-Id") or "").strip()
+        if session_id:
+            return session_id
+
+        try:
+            body = await request.json()
+        except Exception:
+            return ""
+        if not isinstance(body, dict):
+            return ""
+
+        session_id = str(body.get("session_id") or "").strip()
+        if session_id:
+            return session_id
+
+        previous_response_id = body.get("previous_response_id")
+        if previous_response_id:
+            stored = self._response_store.get(str(previous_response_id))
+            if isinstance(stored, dict):
+                session_id = str(stored.get("session_id") or "").strip()
+                if session_id:
+                    return session_id
+
+        if getattr(request, "path", "") == "/v1/chat/completions":
+            messages = body.get("messages")
+            if isinstance(messages, list):
+                system_prompt = None
+                first_user = ""
+                for message in messages:
+                    if not isinstance(message, dict):
+                        continue
+                    role = message.get("role")
+                    content = _normalize_chat_content(message.get("content", ""))
+                    if role == "system":
+                        system_prompt = (
+                            content
+                            if system_prompt is None
+                            else f"{system_prompt}\n{content}"
+                        )
+                    elif role == "user" and not first_user:
+                        first_user = content
+                if first_user:
+                    return _derive_chat_session_id(system_prompt, first_user)
+        return ""
+
+    async def _acquire_session_agent_admission(
+        self, session_id: str
+    ) -> Dict[str, Any]:
+        """Acquire one reference-counted session mutation lane."""
+        entry = self._session_agent_admissions.get(session_id)
+        if entry is None:
+            entry = {"lock": asyncio.Lock(), "refs": 0}
+            self._session_agent_admissions[session_id] = entry
+        entry["refs"] += 1
+        try:
+            await entry["lock"].acquire()
+        except BaseException:
+            entry["refs"] -= 1
+            if (
+                entry["refs"] == 0
+                and self._session_agent_admissions.get(session_id) is entry
+            ):
+                self._session_agent_admissions.pop(session_id, None)
+            raise
+        return entry
+
+    def _release_session_agent_admission(
+        self, reservation: dict[str, Any]
+    ) -> None:
+        """Release a request/task's session lane exactly once."""
+        if not reservation.get("session_admission_active"):
+            return
+        reservation["session_admission_active"] = False
+        session_id = str(reservation.get("session_admission_id") or "")
+        entry = reservation.get("session_admission_entry")
+        if not isinstance(entry, dict):
+            return
+        lock = entry.get("lock")
+        if lock is not None and lock.locked():
+            lock.release()
+        entry["refs"] = max(0, int(entry.get("refs", 0)) - 1)
+        if (
+            entry["refs"] == 0
+            and self._session_agent_admissions.get(session_id) is entry
+        ):
+            self._session_agent_admissions.pop(session_id, None)
+
+    def _detach_admitted_request_to_task(self, task: "asyncio.Task[Any]") -> None:
+        """Keep this request's session lane until its background run settles."""
+        reservation = _api_agent_request_reservation.get()
+        if not reservation or not reservation.get("session_admission_active"):
+            return
+        reservation["session_admission_detached"] = True
+        task.add_done_callback(
+            lambda _done: self._release_session_agent_admission(reservation)
         )
 
     def _activate_admitted_request(self) -> None:
@@ -3694,10 +3829,18 @@ class APIServerAdapter(BasePlatformAdapter):
                 await response.write(f"event: {name}\ndata: {data}\n\n".encode("utf-8"))
                 last_write = time.monotonic()
         except (asyncio.CancelledError, ConnectionResetError):
-            task.cancel()
+            await _cancel_and_wait_task_terminal(task)
             raise
         except Exception as exc:
+            await _cancel_and_wait_task_terminal(task)
             logger.debug("[api_server] session SSE stream error: %s", exc)
+        else:
+            # The task emits the EOS marker from its finally block. Await its
+            # terminal state before request admission can be released.
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
         return response
 
     async def _handle_session_model_lock(self, request: "web.Request") -> "web.Response":
@@ -4262,24 +4405,31 @@ class APIServerAdapter(BasePlatformAdapter):
                 }
             await response.write(f"data: {json.dumps(finish_chunk)}\n\n".encode())
             await response.write(b"data: [DONE]\n\n")
+        except asyncio.CancelledError:
+            agent = agent_ref[0] if agent_ref else None
+            if agent is not None:
+                try:
+                    agent.interrupt("SSE task cancelled")
+                except Exception:
+                    pass
+            await _cancel_and_wait_task_terminal(agent_task)
+            raise
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
-            # Client disconnected mid-stream.  Interrupt the agent so it
-            # stops making LLM API calls at the next loop iteration, then
-            # cancel the asyncio task wrapper.
+            # Client disconnected mid-stream. Interrupt the agent so it stops
+            # making LLM API calls, then wait for task cleanup before the
+            # request's session-admission lane can be released.
             agent = agent_ref[0] if agent_ref else None
             if agent is not None:
                 try:
                     agent.interrupt("SSE client disconnected")
                 except Exception:
                     pass
-            if not agent_task.done():
-                agent_task.cancel()
-                try:
-                    await agent_task
-                except (asyncio.CancelledError, Exception):
-                    pass
+            await _cancel_and_wait_task_terminal(agent_task)
             logger.info("SSE client disconnected; interrupted agent task %s", completion_id)
         except Exception as _exc:
+            # A response-writer failure can happen while the agent is still
+            # active. Seal that child before returning and releasing admission.
+            await _cancel_and_wait_task_terminal(agent_task)
             # Agent crashed mid-stream.  Try to emit an error chunk
             # so the client gets a proper response instead of a
             # TransferEncodingError from incomplete chunked encoding.
@@ -4851,12 +5001,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     agent.interrupt("SSE client disconnected")
                 except Exception:
                     pass
-            if not agent_task.done():
-                agent_task.cancel()
-                try:
-                    await agent_task
-                except (asyncio.CancelledError, Exception):
-                    pass
+            await _cancel_and_wait_task_terminal(agent_task)
             logger.info("SSE client disconnected; interrupted agent task %s", response_id)
         except asyncio.CancelledError:
             # Server-side cancellation (e.g. shutdown, request timeout) —
@@ -4870,8 +5015,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     agent.interrupt("SSE task cancelled")
                 except Exception:
                     pass
-            if not agent_task.done():
-                agent_task.cancel()
+            await _cancel_and_wait_task_terminal(agent_task)
             logger.info("SSE task cancelled; persisted incomplete snapshot for %s", response_id)
             raise
         except Exception as _exc:
@@ -4881,6 +5025,7 @@ class APIServerAdapter(BasePlatformAdapter):
             # get a TransferEncodingError from incomplete chunked encoding.
             import traceback as _tb
             _persist_incomplete_if_needed()
+            await _cancel_and_wait_task_terminal(agent_task)
             agent_error = _redact_api_error_text(_tb.format_exc())
             try:
                 failed_env = _envelope("failed")
@@ -6205,10 +6350,10 @@ class APIServerAdapter(BasePlatformAdapter):
         run_id = f"run_{uuid.uuid4().hex}"
         session_id = session_id or run_id
         # Approval queues gate host-side tool execution and must be isolated
-        # per API run.  Client-provided session IDs and memory session keys are
-        # conversation/memory scopes, not authorization namespaces: multiple
-        # concurrent runs can intentionally share them, and resolving an
-        # approval for one run must not unblock another run's dangerous command.
+        # per API run. Client-provided session IDs and memory session keys are
+        # conversation/memory scopes, not authorization namespaces. Same-session
+        # agent turns are serialized at request admission, but approvals remain
+        # run-scoped so a decision can never bleed into a later run.
         approval_session_key = run_id
         ephemeral_system_prompt = instructions
         loop = asyncio.get_running_loop()
@@ -6491,6 +6636,7 @@ class APIServerAdapter(BasePlatformAdapter):
         self._activate_admitted_request()
         task = asyncio.create_task(_run_and_close())
         self._active_run_tasks[run_id] = task
+        self._detach_admitted_request_to_task(task)
         try:
             self._background_tasks.add(task)
         except TypeError:
@@ -6981,6 +7127,9 @@ class APIServerAdapter(BasePlatformAdapter):
         if self._runner:
             await self._runner.cleanup()
             self._runner = None
+        # All request handlers have drained or been cancelled by runner cleanup.
+        # Do not retain stale per-session lane objects across reconnects.
+        self._session_agent_admissions.clear()
         self._app = None
         logger.info("[%s] API server stopped", self.name)
 
