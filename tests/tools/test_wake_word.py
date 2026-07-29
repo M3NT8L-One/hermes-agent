@@ -262,6 +262,7 @@ def _install_fake_openwakeword(monkeypatch):
     monkeypatch.setitem(sys.modules, "openwakeword", oww)
     monkeypatch.setitem(sys.modules, "openwakeword.model", model_mod)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *a, **k: None)
+    monkeypatch.setattr(ww, "ensure_tflite_runtime", lambda: True)
     return calls
 
 

@@ -267,7 +267,8 @@ def test_streamer_path_writes_pcm_to_output(monkeypatch):
     q = _drain_queue(["Hello there, this is a full sentence."])
     stop, done = threading.Event(), threading.Event()
 
-    with patch("tools.tts_streaming.resolve_streaming_provider", return_value=_Fake({}, {})), \
+    with patch("tools.tts_tool.platform.system", return_value="Linux"), \
+         patch("tools.tts_streaming.resolve_streaming_provider", return_value=_Fake({}, {})), \
          patch.object(tts_tool, "_import_sounddevice", return_value=sd):
         tts_tool.stream_tts_to_speaker(q, stop, done)
 

@@ -297,6 +297,7 @@ class TestAPIServerDisconnectClosesResponseStore:
         adapter._runner = None
         adapter._app = None
         adapter._response_store = store
+        adapter._session_agent_admissions = {}
         adapter.platform = Platform.API_SERVER
         return adapter
 

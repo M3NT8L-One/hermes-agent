@@ -741,6 +741,7 @@ class TestTranscribeLocalExtended:
         }
 
         with patch("tools.transcription_tools._HAS_FASTER_WHISPER", True), \
+             patch("tools.transcription_tools._should_force_faster_whisper_cpu", return_value=False), \
              patch("faster_whisper.WhisperModel", mock_whisper_cls), \
              patch("tools.transcription_tools._local_model", None), \
              patch("tools.transcription_tools._local_model_name", None), \
@@ -767,6 +768,7 @@ class TestTranscribeLocalExtended:
         mock_whisper_cls = MagicMock(return_value=mock_model)
 
         with patch("tools.transcription_tools._HAS_FASTER_WHISPER", True), \
+             patch("tools.transcription_tools._should_force_faster_whisper_cpu", return_value=False), \
              patch("faster_whisper.WhisperModel", mock_whisper_cls), \
              patch("tools.transcription_tools._local_model", None), \
              patch("tools.transcription_tools._local_model_name", None), \
@@ -949,6 +951,7 @@ class TestTranscribeLocalExtended:
             return models.pop(0)
 
         with patch("tools.transcription_tools._HAS_FASTER_WHISPER", True), \
+             patch("tools.transcription_tools._should_force_faster_whisper_cpu", return_value=False), \
              patch("faster_whisper.WhisperModel", side_effect=fake_whisper), \
              patch("tools.transcription_tools._local_model", None), \
              patch("tools.transcription_tools._local_model_name", None):

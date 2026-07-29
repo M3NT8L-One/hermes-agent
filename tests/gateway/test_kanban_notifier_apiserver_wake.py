@@ -131,7 +131,7 @@ def test_apiserver_sub_wakes_real_session_via_self_post(tmp_path, monkeypatch):
 
     posts = []
 
-    async def fake_self_post(adapter, *, text, session_id):
+    async def fake_self_post(_adapter, *, text, session_id, delivery_key):
         posts.append({"text": text, "session_id": session_id})
 
     import gateway.wake as wake_mod
@@ -165,7 +165,7 @@ def test_apiserver_failed_self_post_rewinds_cursor(tmp_path, monkeypatch):
         "api_server", "raw-sid-999", session_id="raw-sid-999",
     )
 
-    async def failing_self_post(adapter, *, text, session_id):
+    async def failing_self_post(_adapter, *, text, session_id, delivery_key):
         raise RuntimeError("self-post exhausted retries")
 
     import gateway.wake as wake_mod
@@ -196,7 +196,7 @@ def test_apiserver_self_post_succeeds_after_earlier_failure(tmp_path, monkeypatc
 
     calls = {"n": 0}
 
-    async def flaky_self_post(adapter, *, text, session_id):
+    async def flaky_self_post(_adapter, *, text, session_id, delivery_key):
         calls["n"] += 1
         if calls["n"] == 1:
             raise RuntimeError("transient outage")
