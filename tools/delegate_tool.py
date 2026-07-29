@@ -2482,13 +2482,6 @@ def _run_single_child(
                     "before_first_llm_call" if child_api_calls == 0
                     else "after_llm_calls"
                 ),
-                "timeout_seconds": child_timeout if is_timeout else None,
-                "timed_out_after_seconds": duration if is_timeout else None,
-                "timeout_phase": (
-                    "before_first_llm_call" if is_timeout and child_api_calls == 0
-                    else "after_llm_calls" if is_timeout
-                    else None
-                ),
                 "route_class": getattr(child, "_delegate_route_class", None),
                 "capability_grant": getattr(
                     child, "_delegate_capability_grant_name", None
@@ -2527,6 +2520,9 @@ def _run_single_child(
                 "exit_reason": "error",
                 "api_calls": 0,
                 "duration_seconds": duration,
+                "timeout_seconds": None,
+                "timed_out_after_seconds": None,
+                "timeout_phase": None,
                 "route_class": getattr(child, "_delegate_route_class", None),
                 "capability_grant": getattr(
                     child, "_delegate_capability_grant_name", None
